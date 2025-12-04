@@ -212,6 +212,48 @@ class EAGLEWorker(TpModelWorker):
                 self.init_attention_backend()
                 self.init_cuda_graphs()
 
+        if self.adaptive_spec_threshold is not None:
+            self.init_target_normal_decode_graph()
+
+    def init_target_normal_decode_graph(self):
+        """Initialize CUDA graph for normal decoding on the target worker."""
+        if self.server_args.disable_cuda_graph:
+            return
+
+        logger.info("Capture target normal decode cuda graph begin.")
+        target_runner = self.target_worker.model_runner
+
+        # Backup
+        old_spec_algo = target_runner.spec_algorithm
+        old_attn_backend = target_runner.attn_backend
+        old_graph_runner = target_runner.graph_runner
+
+        try:
+            # Switch to normal decode mode
+            target_runner.spec_algorithm = SpeculativeAlgorithm.NONE
+
+            # Init attention backend for normal decode
+            target_runner.init_attention_backend()
+            self.target_normal_decode_attn_backend = target_runner.attn_backend
+
+            # Init cuda graph for normal decode
+            # Only capture for batch sizes > threshold where we expect to run normal decode
+            min_bs = (
+                (self.adaptive_spec_threshold + 1)
+                if self.adaptive_spec_threshold is not None
+                else 1
+            )
+            target_runner.init_device_graphs(strategy_min_bs=min_bs)
+            self.target_normal_decode_graph_runner = target_runner.graph_runner
+
+        finally:
+            # Restore
+            target_runner.spec_algorithm = old_spec_algo
+            target_runner.attn_backend = old_attn_backend
+            target_runner.graph_runner = old_graph_runner
+
+        logger.info("Capture target normal decode cuda graph end.")
+
     def reset_adaptive_spec_params(self):
         """Reset adaptive speculative decoding state."""
         self.adaptive_spec_consecutive_checks = 0
@@ -385,7 +427,32 @@ class EAGLEWorker(TpModelWorker):
                 batch.spec_info = None
 
                 model_worker_batch = batch.get_model_worker_batch()
-                batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+
+                # Swap resources if we have them
+                use_normal_graph = (
+                    self.adaptive_spec_threshold is not None
+                    and hasattr(self, "target_normal_decode_graph_runner")
+                    and self.target_normal_decode_graph_runner is not None
+                )
+
+                if use_normal_graph:
+                    old_attn = self.target_worker.model_runner.attn_backend
+                    old_graph = self.target_worker.model_runner.graph_runner
+                    self.target_worker.model_runner.attn_backend = (
+                        self.target_normal_decode_attn_backend
+                    )
+                    self.target_worker.model_runner.graph_runner = (
+                        self.target_normal_decode_graph_runner
+                    )
+
+                try:
+                    batch_result = self.target_worker.forward_batch_generation(
+                        model_worker_batch
+                    )
+                finally:
+                    if use_normal_graph:
+                        self.target_worker.model_runner.attn_backend = old_attn
+                        self.target_worker.model_runner.graph_runner = old_graph
 
                 return GenerationBatchResult(
                     logits_output=batch_result.logits_output,
