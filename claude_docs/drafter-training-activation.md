@@ -417,6 +417,10 @@ async def cleanup_training(self):
         offload_fsdp_optimizer(self.optimizer)
 ```
 
+### Weight Sync to SGLang (After Training)
+
+Trained weights are **not synced immediately**. Instead, at the start of the next rollout, `FSDPSGLangShardingManager.wake_up()` reads the latest `drafter_module.state_dict()` and pushes it to SGLang. This works because `drafter_module_fsdp` is the same Python object shared between the trainer and the sharding manager - training updates it in-place. See [Co-training Pipeline](./co-training-pipeline.md#weight-synchronization-to-sglang) for full details.
+
 ## Key Files Reference
 
 | File | Lines | Purpose |

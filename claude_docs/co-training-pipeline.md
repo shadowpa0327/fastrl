@@ -118,36 +118,60 @@ def _train_step(self, batch):
     return loss.item()
 ```
 
-### Weight Synchronization
+### Weight Synchronization to SGLang
+
+Drafter weights are **not explicitly synced after training**. Instead, they sync automatically at the **start of the next rollout** via a shared FSDP module reference.
+
+**The shared reference** (`fsdp_workers.py:788-798`):
 
 ```python
-def get_drafter_weights(self):
-    """Extract drafter weights for SGLang update."""
+# Same drafter_module_fsdp object is given to both:
+rollout.drafter_manager.background_trainer = EagleBackgroundTrainer(
+    drafter_module_fsdp, ...       # ← Training updates this in-place
+)
+rollout_sharding_manager.drafter_module = drafter_module_fsdp  # ← wake_up() reads from this
+```
 
-    # Gather full state dict from FSDP shards
-    with FSDP.state_dict_type(
-        self.drafter_model,
-        StateDictType.FULL_STATE_DICT
-    ):
-        state_dict = self.drafter_model.state_dict()
+**Sync happens in `wake_up()`** (`fsdp_sglang.py:196-266`), triggered by `with self.rollout_sharding_manager:` at the start of each rollout:
 
-    # Filter to only trainable parameters
-    trainable_dict = self._get_trainable_state_dict(state_dict)
+```python
+async def wake_up(self):
+    # 1. Sync actor weights to SGLang
+    params = self.module.state_dict()
+    await self.update_weights(params)
 
-    return trainable_dict
+    # 2. Sync drafter weights to SGLang
+    if self.drafter_module is not None:
+        drafter_params = self.drafter_module.state_dict()  # reads trained weights
+        drafter_params = convert_weight_keys(drafter_params, ...)
+        await self.update_drafter_weights(drafter_params)  # pushes to SGLang
+```
 
-def sync_weights_to_sglang(self, sglang_client):
-    """Push updated weights to running SGLang engine."""
+**Weight transfer pipeline** (`fsdp_sglang.py:143-162`):
 
-    weights = self.get_drafter_weights()
+```
+drafter_module.state_dict()   →  FSDP DTensor (sharded)
+         │ full_tensor()
+         ▼
+Regular Tensor (gathered)     →  convert_weight_keys()
+         │ get_named_tensor_buckets()
+         ▼
+Batched tensors               →  sgl_update_weights(is_draft_model=True)
+         │ dist.gather_object() across TP ranks
+         ▼
+SGLang engine                 →  flush_cache()
+```
 
-    # Send via SGLang's weight update API
-    sglang_client.update_weights(
-        UpdateWeightsFromTensorReqInput(
-            model_name="eagle_drafter",
-            weights=weights,
-        )
-    )
+**Timeline**:
+
+```
+Step N:  Train drafter (updates FSDP module in-place) → offload to CPU
+                                                            │
+Step N+1: with sharding_manager: ───────────────────────────┘
+              └── wake_up()
+                   ├── sync actor weights
+                   ├── sync drafter weights  ◀── reads latest trained weights
+                   └── flush KV cache
 ```
 
 ## Hidden State Collection
