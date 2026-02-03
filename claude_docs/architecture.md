@@ -384,6 +384,7 @@ Legend:
 
 ## See Also
 
+- [Worker Hierarchy & GPU Allocation](./worker-hierarchy-gpu-allocation.md) - Ownership chain, Ray resource pools, data dispatch
 - [Co-training Pipeline Details](./co-training-pipeline.md)
 - [Drafter Training Activation](./drafter-training-activation.md) - GPU memory management, activation call chain
 - [Speculative Decoding Deep Dive](./speculative-decoding.md)
