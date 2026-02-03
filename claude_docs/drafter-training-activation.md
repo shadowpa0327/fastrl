@@ -430,6 +430,7 @@ async def cleanup_training(self):
 
 ## See Also
 
+- [Worker Hierarchy & GPU Allocation](./worker-hierarchy-gpu-allocation.md) - Ownership chain above SGLangRollout
 - [Co-training Pipeline](./co-training-pipeline.md) - Training logic details
 - [Hidden States Collection](./hidden-states-collection.md) - Data flow for training
 - [Architecture Overview](./architecture.md) - System-level view
