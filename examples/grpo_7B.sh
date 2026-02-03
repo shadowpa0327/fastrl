@@ -3,7 +3,7 @@ export NCCL_DEBUG=WARN
 export MKL_SERVICE_FORCE_INTEL=1
 # export RAY_DEBUG_POST_MORTEM=1
 
-CKPT_PATH=path-to-your-runs
+CKPT_PATH=ckpts
 
 PROJECT_NAME=FastRL
 EXPERIMENT_NAME=Qwen2.5-7B
@@ -15,7 +15,7 @@ train_prompt_bsz=64
 n_resp_per_prompt=8
 train_prompt_mini_bsz=4
 max_prompt_length=$((1024 * 1))
-max_response_length=$((1024 * 32))
+max_response_length=$((1024 * 12))
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 
@@ -72,7 +72,7 @@ python3 -m verl.trainer.main_fastrl \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$CKPT_PATH/$PROJECT_NAME/$EXPERIMENT_NAME \
     trainer.val_before_train=False \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=30 \
     trainer.test_freq=-1 \

@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 import os
 import time
@@ -15,6 +16,12 @@ def load_json_file(json_file):
 
 
 def main():
+    # Ensure an event loop exists (required for Python 3.10+ with uvloop)
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="deepseek-r1", help="Path to the model")
     parser.add_argument("--data_dir", type=str, default="Eurus-Data", help="Path to the data directory")

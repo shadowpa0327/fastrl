@@ -84,6 +84,8 @@ from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# Ensure an event loop exists for asyncio primitives (required for Python 3.10+ with uvloop)
+asyncio.set_event_loop(asyncio.new_event_loop())
 
 _is_cuda = is_cuda()
 

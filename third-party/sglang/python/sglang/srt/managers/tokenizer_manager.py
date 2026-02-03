@@ -102,6 +102,8 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# Ensure an event loop exists for asyncio primitives (required for Python 3.10+ with uvloop)
+asyncio.set_event_loop(asyncio.new_event_loop())
 
 logger = logging.getLogger(__name__)
 
