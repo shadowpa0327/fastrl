@@ -146,6 +146,7 @@ See `claude_docs/` for comprehensive documentation:
 
 - **[Architecture](./claude_docs/architecture.md)**: System diagrams, component interactions, data flow
 - **[Co-training Pipeline](./claude_docs/co-training-pipeline.md)**: EAGLE background training details
+- **[Drafter Training Activation](./claude_docs/drafter-training-activation.md)**: GPU memory management, bubble resource usage, activation call chain
 - **[Hidden States Collection](./claude_docs/hidden-states-collection.md)**: How hidden states flow from rollouts to drafter training
 - **[Speculative Decoding](./claude_docs/speculative-decoding.md)**: SD algorithm, MAB strategy selection
 - **[Key Files Reference](./claude_docs/key-files.md)**: File-by-file guide for hacking

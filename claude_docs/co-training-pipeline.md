@@ -339,6 +339,7 @@ wandb.log(metrics, step=global_step)
 ## See Also
 
 - [Architecture Overview](./architecture.md)
+- [Drafter Training Activation](./drafter-training-activation.md) - GPU memory management, activation call chain
 - [Hidden States Collection](./hidden-states-collection.md) - Deep dive into hidden state data flow
 - [Speculative Decoding](./speculative-decoding.md)
 - [Key Files Reference](./key-files.md)

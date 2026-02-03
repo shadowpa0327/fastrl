@@ -385,5 +385,6 @@ Legend:
 ## See Also
 
 - [Co-training Pipeline Details](./co-training-pipeline.md)
+- [Drafter Training Activation](./drafter-training-activation.md) - GPU memory management, activation call chain
 - [Speculative Decoding Deep Dive](./speculative-decoding.md)
 - [Key Files Reference](./key-files.md)
