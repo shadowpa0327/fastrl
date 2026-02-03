@@ -152,7 +152,7 @@ def sync_weights_to_sglang(self, sglang_client):
 
 ## Hidden State Collection
 
-### From SGLang (Preferred)
+Hidden states are collected from SGLang during speculative decoding verification:
 
 ```python
 # In sglang_rollout.py
@@ -175,24 +175,7 @@ def generate_sequences(self, prompts, ...):
         })
 ```
 
-### From Actor Forward (Fallback)
-
-```python
-# In fsdp_workers.py
-def collect_hidden_states_from_actor(self, input_ids):
-    """Fallback when SGLang collection unavailable."""
-
-    with torch.no_grad():
-        outputs = self.actor_model(
-            input_ids=input_ids,
-            output_hidden_states=True,
-        )
-
-    # Get last layer hidden states
-    hidden_states = outputs.hidden_states[-1]
-
-    return hidden_states
-```
+This is efficient because hidden states are already computed during the verification step of speculative decoding - no extra forward passes needed.
 
 ## Training Schedule
 

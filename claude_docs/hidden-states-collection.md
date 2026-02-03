@@ -6,37 +6,25 @@ This document details how hidden states are collected during RL rollouts and con
 
 Hidden states from the target model's last layer serve as training data for the EAGLE drafter. The drafter learns to predict the next hidden state given the current one, enabling it to draft tokens that the target model is likely to accept.
 
-> **⚠️ IMPORTANT: Hidden States Source Clarification**
->
-> There are two collection paths in the codebase, but **only SGLang is the effective source**:
->
-> | Path | Code Location | Status |
-> |------|---------------|--------|
-> | **Source A: SGLang** | `sglang_rollout.py:890-940` | ✅ **Active** - Used for training |
-> | **Source B: Actor Forward** | `ray_trainer.py:1202-1227` | ⚠️ **Collects but unused** |
->
-> The Actor path collects hidden states to `data_buffer`, but the trainer **blocks** (refuses to run)
-> unless `collect_hidden_states_from_sgl=True`. See [Trainer Blocking Behavior](#trainer-blocking-behavior) below.
+> **Note**: Hidden states are collected from SGLang during the speculative decoding verification step.
+> This is efficient because the hidden states are already computed - no extra forward passes needed.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                     Hidden States Collection Flow                            │
 │                                                                              │
 │   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                    Two Collection Sources                            │   │
+│   │                   SGLang Hidden State Collection                     │   │
 │   │                                                                      │   │
-│   │  Source A: SGLang Engine              Source B: Actor Forward        │   │
-│   │  ┌─────────────────────────┐         ┌─────────────────────────┐    │   │
-│   │  │ Collected during        │         │ Explicit forward pass   │    │   │
-│   │  │ speculative decoding    │         │ on rollout data         │    │   │
-│   │  │ verification step       │         │ (fallback method)       │    │   │
-│   │  │                         │         │                         │    │   │
-│   │  │ Efficient: no extra     │         │ More compute but        │    │   │
-│   │  │ forward passes needed   │         │ always available        │    │   │
-│   │  └───────────┬─────────────┘         └───────────┬─────────────┘    │   │
-│   │              │                                   │                   │   │
-│   │              └─────────────┬─────────────────────┘                   │   │
-│   │                            ▼                                         │   │
+│   │              ┌─────────────────────────┐                            │   │
+│   │              │ Collected during        │                            │   │
+│   │              │ speculative decoding    │                            │   │
+│   │              │ verification step       │                            │   │
+│   │              │                         │                            │   │
+│   │              │ Efficient: no extra     │                            │   │
+│   │              │ forward passes needed   │                            │   │
+│   │              └───────────┬─────────────┘                            │   │
+│   │                          ▼                                          │   │
 │   │              ┌─────────────────────────┐                            │   │
 │   │              │     Normalization       │                            │   │
 │   │              │  Shape: [seq_len, D]    │                            │   │
@@ -144,140 +132,6 @@ if should_collect:
 - No extra forward passes needed
 - Hidden states already computed during verification
 - Efficient: reuses existing computation
-
-## Source B: Actor Model Collection (Fallback)
-
-**Files**:
-- `verl/workers/fsdp_workers.py` (lines 1014-1036) - Entry point
-- `verl/workers/actor/dp_actor.py` (lines 354-456) - Core implementation
-
-### Entry Point: FSDP Worker
-
-**File**: `verl/workers/fsdp_workers.py:1014-1036`
-
-```python
-# Line 1014: Extract return_hidden_states flag from meta_info
-return_hidden_states = data.meta_info.pop("return_hidden_states", False)
-
-# Line 1025: Call compute_log_prob with hidden states flag
-result = self.actor.compute_log_prob(
-    data=data,
-    calculate_entropy=True,
-    return_hidden_states=return_hidden_states
-)
-
-# Lines 1026-1029: Unpack results
-if return_hidden_states:
-    output, entropys, hidden_states = result
-else:
-    output, entropys = result
-
-# Lines 1034-1036: Store hidden states in meta_info for downstream use
-if return_hidden_states:
-    meta_info_dict["hidden_states"] = hidden_states
-```
-
-### Core Implementation: DPActor.compute_log_prob
-
-**File**: `verl/workers/actor/dp_actor.py:354-456`
-
-```python
-# Line 354: Method signature
-def compute_log_prob(self, data: DataProto, calculate_entropy=False, return_hidden_states=False):
-    """
-    Args:
-        return_hidden_states (bool): Whether to return hidden states from the last layer
-    Returns:
-        hidden_states: list of torch.Tensor or None (if return_hidden_states=True)
-    """
-
-    # Line 397: Initialize hidden states list
-    hidden_states_lst = [] if return_hidden_states else None
-
-    # Lines 399-405: Forward through micro-batches
-    for micro_batch in micro_batches:
-        model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-        with torch.no_grad():
-            result = self._forward_micro_batch(
-                model_inputs,
-                temperature=temperature,
-                calculate_entropy=calculate_entropy,
-                return_hidden_states=return_hidden_states
-            )
-```
-
-### Micro-Batch Forward: _forward_micro_batch
-
-**File**: `verl/workers/actor/dp_actor.py:92-232`
-
-```python
-# Line 93: Method signature
-def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, return_hidden_states=False):
-    """
-    Returns:
-        hidden_states: # (bs, seqlen, hidden_dim) - optional, if return_hidden_states=True
-    """
-
-    # Lines 180-182: Request hidden states from model
-    if return_hidden_states:
-        extra_args["output_hidden_states"] = True
-
-    # Lines 184-191: Model forward pass
-    output = self.actor_module(
-        input_ids=input_ids_rmpad,
-        attention_mask=None,
-        position_ids=position_ids_rmpad,
-        use_cache=False,
-        **extra_args,
-    )
-
-    # Lines 220-231: Extract hidden states from model output
-    hidden_states_rmpad = None
-    hidden_states_indices = None
-    hidden_states_shape_info = None
-    if return_hidden_states:
-        if hasattr(output, "hidden_states") and output.hidden_states is not None:
-            # Get last layer hidden states (in rmpad format)
-            # Shape: ((total_nnz / sp) + pad, hidden_dim)
-            hidden_states_rmpad = output.hidden_states[-1].squeeze(0)
-            # Store reconstruction info
-            hidden_states_shape_info = (batch_size, seqlen)
-            hidden_states_indices = indices
-```
-
-### Hidden States Reconstruction
-
-**File**: `verl/workers/actor/dp_actor.py:407-432`
-
-```python
-# Lines 407-432: Handle rmpad format from flash-attention
-if return_hidden_states:
-    entropy, log_probs, hidden_states = result
-
-    if hidden_states is not None:
-        if isinstance(hidden_states, tuple):
-            # rmpad format: (rmpad_hidden_states, indices, (batch_size, seqlen))
-            rmpad_hs, indices, (bsz, seqlen) = hidden_states
-
-            # Line 416-423: Reconstruct full tensor using flash-attn padding utility
-            from flash_attn.bert_padding import pad_input as pad_input_cpu
-
-            full_hs = pad_input_cpu(
-                hidden_states=rmpad_hs,  # already on CPU
-                indices=indices,
-                batch=bsz,
-                seqlen=seqlen,
-            )  # (batch_size, seqlen, hidden_dim) on CPU
-
-            # Lines 425-426: Extract per-sample hidden states
-            for sample_idx in range(bsz):
-                hidden_states_lst.append(full_hs[sample_idx])  # [seq_len, hidden_dim]
-        else:
-            # Lines 428-432: Regular tensor format (non-rmpad path)
-            for sample_idx in range(hidden_states.size(0)):
-                sample_hidden = hidden_states[sample_idx]  # [seq_len, hidden_dim]
-                hidden_states_lst.append(sample_hidden.detach().cpu())
-```
 
 ## Data Buffer Implementation
 
@@ -1107,118 +961,6 @@ class LlamaModel(LlamaModelTF):
 | EAGLE Model | `eagle-train/model/llama_eagle.py` | 34-99 | Model forward pass |
 | EAGLE3 Model | `eagle-train/model/llama_eagle3.py` | 297-468 | Multi-step prediction |
 | Data Generation | `eagle-train/eagle_datagen.py` | 371-407 | Extract hidden states |
-
-### Collection Files Reference (Source B: Actor Forward)
-
-| Component | File | Key Lines | Purpose |
-|-----------|------|-----------|---------|
-| Entry Point | `verl/workers/fsdp_workers.py` | 1014-1036 | Trigger hidden states collection |
-| Core Logic | `verl/workers/actor/dp_actor.py` | 354-456 | `compute_log_prob` with hidden states |
-| Micro-batch Forward | `verl/workers/actor/dp_actor.py` | 92-232 | `_forward_micro_batch` extraction |
-| Reconstruction | `verl/workers/actor/dp_actor.py` | 407-432 | Handle rmpad format, per-sample extraction |
-
----
-
-## Trainer Blocking Behavior
-
-### What "Trainer Blocks" Means
-
-The EAGLE background trainer has a guard condition that **refuses to execute training** if `collect_hidden_states_from_sgl=False`:
-
-**File**: `verl/workers/drafter/eagle_background_trainer.py:472-479`
-
-```python
-async def _training_step_impl(self, step: int) -> bool:
-    """Execute a single training step."""
-
-    # THIS IS THE BLOCKING CHECK
-    collect_hidden_states_from_sgl = bool(self.config.get("collect_hidden_states_from_sgl", False))
-    if not collect_hidden_states_from_sgl:
-        logger.debug(
-            f"[EagleTrainer rank {self.rank}] Skipping training step {step} "
-            f"because collect_hidden_states_from_sgl=False"
-        )
-        return False  # ← EARLY RETURN - training does not proceed
-
-    # Training code below never executes if above returns False
-    batch = self._prepare_training_batch()
-    ...
-```
-
-### Why This Creates a Problem
-
-The Actor path (`ray_trainer.py:1202-1227`) collects hidden states **independently** of this flag:
-
-```python
-# ray_trainer.py - Actor collection trigger
-should_collect_for_drafter = (
-    self.config.speculative.get("train", {}).get("enable_drafter_training", False)
-    # Note: Does NOT check collect_hidden_states_from_sgl!
-)
-
-if should_collect_for_drafter:
-    batch.meta_info["return_hidden_states"] = True
-    old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-    hidden_states = old_log_prob.meta_info.pop("hidden_states")
-    # Data IS added to buffer...
-    self.actor_rollout_wg.apply("add_drafter_data_to_buffer", batch, hidden_states)
-```
-
-### The Result
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Data Flow When collect_hidden_states_from_sgl=False    │
-│                                                                              │
-│   Actor Forward                                                              │
-│   (ray_trainer.py:1202-1227)                                                │
-│         │                                                                    │
-│         │ Collects hidden_states                                            │
-│         ▼                                                                    │
-│   add_drafter_data_to_buffer()                                              │
-│   (fsdp_workers.py:1163-1191)                                               │
-│         │                                                                    │
-│         │ Adds to data_buffer                                               │
-│         ▼                                                                    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │                     data_buffer                                      │   │
-│   │                  (contains hidden states!)                           │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│         │                                                                    │
-│         │ Training step called                                              │
-│         ▼                                                                    │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │  _training_step_impl()                                               │   │
-│   │                                                                      │   │
-│   │  if not collect_hidden_states_from_sgl:                             │   │
-│   │      return False  ← BLOCKED! Data in buffer is IGNORED            │   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│   Result: Hidden states collected but NEVER USED for training               │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Summary Table
-
-| `collect_hidden_states_from_sgl` | SGLang Collects | Actor Collects | Training Runs | Effective Behavior |
-|----------------------------------|-----------------|----------------|---------------|-------------------|
-| `True` | ✅ Yes | ✅ Yes | ✅ Yes | Normal training with SGLang data |
-| `False` | ❌ No | ✅ Yes | ❌ **Blocked** | Actor collects but data is wasted |
-
-### Potential Fix (Not Implemented)
-
-To enable Actor-based collection, the blocking check should be modified:
-
-```python
-# Current (blocks Actor path):
-if not collect_hidden_states_from_sgl:
-    return False
-
-# Potential fix (allow training if data_buffer has data):
-if len(self.data_buffer) == 0 and len(self.collected_data) == 0:
-    return False  # Only block if NO data available
-```
 
 ## See Also
 

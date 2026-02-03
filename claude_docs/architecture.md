@@ -159,16 +159,16 @@ Prompts (from dataset)
 │                                                                              │
 │   ┌──────────────────────────────────────────────────────────────────────┐  │
 │   │                     Hidden State Collection                           │  │
+│   │                        (from SGLang)                                  │  │
 │   │                                                                       │  │
-│   │  Source A: SGLang       OR      Source B: Actor Forward               │  │
-│   │  ┌─────────────────┐           ┌─────────────────┐                   │  │
-│   │  │ Collect during  │           │ Explicit forward│                   │  │
-│   │  │ verification    │           │ pass on rollout │                   │  │
-│   │  │ (efficient)     │           │ data            │                   │  │
-│   │  └────────┬────────┘           └────────┬────────┘                   │  │
-│   │           │                             │                             │  │
-│   │           └──────────┬──────────────────┘                             │  │
-│   │                      ▼                                                │  │
+│   │           ┌─────────────────────┐                                    │  │
+│   │           │ Collect during      │                                    │  │
+│   │           │ speculative decoding│                                    │  │
+│   │           │ verification step   │                                    │  │
+│   │           │ (efficient: no      │                                    │  │
+│   │           │  extra forward)     │                                    │  │
+│   │           └────────┬────────────┘                                    │  │
+│   │                    ▼                                                  │  │
 │   │           ┌─────────────────────┐                                    │  │
 │   │           │    Data Buffer      │                                    │  │
 │   │           │   (deque, max=2000) │                                    │  │
