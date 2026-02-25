@@ -122,9 +122,8 @@ class FSDPSGLangShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager exit", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
-        pass
-        # loop = asyncio.get_event_loop()
-        # loop.run_until_complete(self.sleep())
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.sleep())
 
     async def update_weights(self, params):
         named_tensors = [(k, v) for k, v in params.items()]
