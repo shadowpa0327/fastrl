@@ -488,15 +488,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         ]
         self.drafter_device_mesh = self.global_device_mesh_list[self.rollout_dp_rank]
 
-        # Use defensive access for speculative eagle config
-        if (
-            hasattr(self.config.rollout, "speculative")
-            and hasattr(self.config.rollout.speculative, "eagle")
-            and hasattr(self.config.rollout.speculative.eagle, "spec_model_path")
-        ):
-            spec_model_path = self.config.rollout.speculative.eagle.spec_model_path
-        else:
-            raise ValueError("Speculative eagle config is missing or incomplete: spec_model_path not found")
+        spec_model_path = self.config.rollout.speculative.eagle.spec_model_path
         config = deepcopy(self.actor_model_config)
         config.num_hidden_layers = 1
         config.torch_dtype = torch.bfloat16
@@ -786,16 +778,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             raise NotImplementedError(f"Rollout name: {self.config.rollout.name} is not supported")
 
         if enable_drafter_training:
-            rollout.drafter_manager.background_trainer = EagleBackgroundTrainer(
+            self.drafter_trainer = EagleBackgroundTrainer(
                 drafter_module_fsdp,
                 drafter_optimizer,
                 drafter_lr_scheduler,
                 drafter_train_config,
                 self.drafter_device_mesh,
-                model_config=self.actor_model_config,  # Pass the model config for padding token id etc.
+                model_config=self.actor_model_config,
             )
-            # Update sharding manager with eagle module
+            rollout.drafter_trainer = self.drafter_trainer  # shared ref for data collection
             rollout_sharding_manager.drafter_module = drafter_module_fsdp
+        else:
+            self.drafter_trainer = None
+
+        # Store drafter scheduling config
+        self._enable_drafter_training = enable_drafter_training
+        self._drafter_training_interval = (
+            self.config.rollout.speculative.train.get("training_interval_steps", 1)
+            if enable_drafter_training else 1
+        )
+        self._drafter_max_steps = (
+            self.config.rollout.speculative.train.get("max_training_steps_per_round", 200)
+            if enable_drafter_training else 0
+        )
+        self._drafter_rl_step = 0
 
         return rollout, rollout_sharding_manager
 
@@ -993,10 +999,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def train_drafter(self):
+        """Train the drafter model synchronously after rollout."""
+        if not self._enable_drafter_training:
+            return
+        if self._drafter_rl_step % self._drafter_training_interval != 0:
+            return
+        self.drafter_trainer.train(num_steps=self._drafter_max_steps)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def increment_rl_step(self):
-        if self._is_rollout and hasattr(self.rollout, "increment_rl_step"):
-            self.rollout.increment_rl_step()
-            
+        if self._enable_drafter_training:
+            self._drafter_rl_step += 1
+            self.drafter_trainer.increment_rl_step()
+
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
@@ -1158,37 +1174,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    def add_drafter_data_to_buffer(self, batch: DataProto, hidden_states: list) -> None:
-        """Add collected data with hidden states to the drafter's DataBuffer.
-
-        This is called during the compute_log_prob phase to collect training data for the Eagle drafter model.
-        """
-        # Only proceed if we have a drafter manager with background trainer
-        if not hasattr(self, "ulysses_sharding_manager") or self.ulysses_sharding_manager is None:
-            return
-
-        sharding_mgr = self.ulysses_sharding_manager
-        if not hasattr(sharding_mgr, "drafter_module") or sharding_mgr.drafter_module is None:
-            return
-
-        # Get the drafter manager from rollout (if using hybrid engine)
-        if hasattr(self, "rollout") and hasattr(self.rollout, "drafter_manager"):
-            drafter_manager = self.rollout.drafter_manager
-            if drafter_manager is not None and hasattr(drafter_manager, "background_trainer"):
-                bg_trainer = drafter_manager.background_trainer
-                if bg_trainer is not None and hasattr(bg_trainer, "data_buffer"):
-                    # Add data to the buffer
-                    bg_trainer.data_buffer.add_batch(
-                        batch={
-                            "input_ids": batch.batch.get("input_ids"),
-                            "responses": batch.batch.get("responses"),
-                            "prompts": batch.batch.get("prompts"),
-                        },
-                        hidden_states=hidden_states,
-                    )
-                    logger.info(f"[Rank {self.rank}] Added {len(hidden_states)} samples to drafter DataBuffer")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:

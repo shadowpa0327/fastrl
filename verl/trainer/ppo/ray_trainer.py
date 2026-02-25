@@ -1148,6 +1148,10 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    # Train drafter model synchronously after rollout
+                    with marked_timer("train_drafter", timing_raw, color="green"):
+                        self.actor_rollout_wg.train_drafter()
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1199,36 +1203,10 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        # Check if we should collect hidden states for drafter training
-                        should_collect_for_drafter = False
-                        if (
-                            hasattr(self.config, "speculative")
-                            and self.config.speculative.get("enable", False)
-                            and self.config.speculative.get("train", {}).get("enable_drafter_training", False)
-                        ):
-                            training_interval_steps = self.config.speculative.get("train", {}).get(
-                                "training_interval_steps", 1
-                            )
-                            # Collect one step before training
-                            should_collect_for_drafter = (self.global_steps + 1) % training_interval_steps == 0
-
-                        if should_collect_for_drafter:
-                            batch.meta_info["return_hidden_states"] = True
-
+                        # TODO: Also collect hidden states from compute_log_prob for drafter training
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
 
-                        # Extract and send hidden states to drafter manager if available
-                        if should_collect_for_drafter and "hidden_states" in old_log_prob.meta_info:
-                            hidden_states = old_log_prob.meta_info.pop("hidden_states")
-                            try:
-                                self.actor_rollout_wg.apply("add_drafter_data_to_buffer", batch, hidden_states)
-                            except Exception as e:
-                                logger.warning(f"Failed to add drafter data to buffer: {e}")
-
-                        # Clean up meta_info
-                        if "return_hidden_states" in batch.meta_info:
-                            batch.meta_info.pop("return_hidden_states")
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
@@ -1410,6 +1388,9 @@ class RayPPOTrainer:
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+                # Increment RL step counter for drafter data buffer
+                self.actor_rollout_wg.increment_rl_step()
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

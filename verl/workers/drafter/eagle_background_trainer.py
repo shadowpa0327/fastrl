@@ -1,14 +1,11 @@
-import asyncio
 import logging
 import os
 import time
 from collections import deque
-from datetime import timedelta
 from typing import Optional
 
 import torch
 import torch.distributed.checkpoint as dcp
-from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import SmoothL1Loss
 from torch.nn import functional as F
 
@@ -56,12 +53,9 @@ class EagleBackgroundTrainer:
 
         self.rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
-        self._training_initialized = False
-        self._training_active = False
         self.training_steps = 0
 
         self.collected_data = deque(maxlen=int(self.config.get("buffer_max_samples", 2000)))
-        self.shared_data_buffer = None
         self.batch_size = int(self.config.get("batch_size_per_gpu", 32))
 
         # Initialize DataBuffer for storing data across RL steps
@@ -72,7 +66,6 @@ class EagleBackgroundTrainer:
 
         self.criterion = SmoothL1Loss(reduction="none")
 
-        self.eagle_model_path = self.config.get("eagle_model_path", self.config.get("spec_model_path"))
         self.checkpoint_dir = self.config.get("checkpoint_path")
         self._last_ckpt_step = -1
         # New: optional per-step barrier (default False to avoid stalls)
@@ -90,17 +83,6 @@ class EagleBackgroundTrainer:
                 f"EagleBackgroundTrainer use_ulysses_sp={self.use_ulysses_sp} "
                 f"(sp_size={self.ulysses_sequence_parallel_size})"
             )
-
-    def _get_model_class(self, model_type: str):
-        if model_type.lower() == "llama":
-            from verl.workers.drafter.model.llama_eagle import LlamaForCausalLMEagle
-
-            return LlamaForCausalLMEagle
-        if model_type.lower() == "qwen2":
-            from verl.workers.drafter.model.qwen2_eagle import Qwen2ForCausalLMEagle
-
-            return Qwen2ForCausalLMEagle
-        raise ValueError(f"Unsupported model type: {model_type}")
 
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """Get state dict excluding frozen layers (embed_tokens, lm_head)."""
@@ -151,62 +133,24 @@ class EagleBackgroundTrainer:
             logger.warning(f"Async checkpoint save failed on rank {self.rank}: {e}")
             return None
 
-    async def activate_training_model(
-        self, device_mesh: DeviceMesh, training_ranks: list[int], base_model=None
-    ) -> bool:
+    def activate_training_model(self):
+        """Load drafter model and optimizer to GPU for training."""
         start_ts = time.time()
-        try:
-            logger.warning(
-                f"[EagleTrainer rank {getattr(self, 'rank', -1)}] activate_training_model enter "
-                f"training_ranks={training_ranks}"
-            )
+        first_param = next(self.model.parameters(), None)
+        param_device = first_param.device.type if first_param is not None else None
 
-            first_param = next(self.model.parameters(), None)
-            param_device = first_param.device.type if first_param is not None else None
+        if self.is_offload_param or param_device != "cuda":
+            load_fsdp_model_to_gpu(self.model)
+            logger.debug("Loaded drafter model to GPU for training")
 
-            if self.is_offload_param or param_device != "cuda":
-                load_fsdp_model_to_gpu(self.model)
-                logger.debug("Loaded drafter model to GPU for training")
+        if self.optimizer is not None:
+            load_fsdp_optimizer(optimizer=self.optimizer, device_id=get_device_id())
+            logger.debug("Loaded drafter optimizer to GPU for training")
 
-            if self.optimizer is not None:
-                load_fsdp_optimizer(optimizer=self.optimizer, device_id=get_device_id())
-                logger.debug("Loaded drafter optimizer to GPU for training")
-                # if self.is_offload_optimizer:
-                #     load_fsdp_optimizer(optimizer=self.optimizer, device_id=get_device_id())
-                #     logger.info("Loaded drafter optimizer to GPU for training")
-                # else:
-                #     # Ensure optimizer state tensors reside on the local CUDA device before stepping
-                #     opt_state_param = next(iter(self.optimizer.state.values()), None)
-                #     if opt_state_param:
-                #         for key, value in opt_state_param.items():
-                #             if isinstance(value, torch.Tensor) and value.device.type != "cuda":
-                #                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=get_device_id())
-                #                 logger.info("Moved drafter optimizer state to GPU for training")
-                #                 break
-
-            # Store the device mesh but don't rely on it for distributed operations
-            # that might fail due to workers leaving/joining at different times
-            self.training_device_mesh = device_mesh
-
-            # Check if we can actually use the device mesh for coordination
-            # NOTE: We skip the barrier here because workers may join at slightly different times
-            # and the barrier could cause deadlock. FSDP2 will handle its own synchronization.
-            if device_mesh.size() > 1:
-                logger.debug(f"Training with device_mesh={device_mesh} (skipping init barrier to avoid deadlock)")
-
-            self._training_initialized = True
-            self._training_active = True
-
-            logger.debug(f"Drafter training activated with device_mesh={device_mesh}, training_ranks={training_ranks}")
-            logger.debug(
-                f"[EagleTrainer rank {getattr(self, 'rank', -1)}] activate_training_model success "
-                f"elapsed={time.time() - start_ts:.2f}s"
-            )
-            return True
-
-        except Exception as e:
-            logger.error(f"[EagleTrainer rank {getattr(self, 'rank', -1)}] activate_training_model failed: {e}")
-            return False
+        logger.info(
+            f"[EagleTrainer rank {self.rank}] activate_training_model "
+            f"elapsed={time.time() - start_ts:.2f}s"
+        )
 
     def collect_online_data(self, batch: dict[str, torch.Tensor], hidden_states: list[torch.Tensor]):
         """Collect online data from inference for Eagle training.
@@ -455,27 +399,18 @@ class EagleBackgroundTrainer:
             "loss_mask": loss_mask,
         }
 
-    async def training_step(self, step: int) -> bool:
+    def training_step(self, step: int) -> bool:
         try:
             with torch.enable_grad():
-                return await self._training_step_impl(step)
+                return self._training_step_impl(step)
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
 
-    async def _training_step_impl(self, step: int) -> bool:
+    def _training_step_impl(self, step: int) -> bool:
         """Execute a single training step."""
         if not self.model:
             logger.warning("No model available for training")
-            return False
-
-        # Skip training if we're not collecting hidden states (since we can't train without them)
-        collect_hidden_states_from_sgl = bool(self.config.get("collect_hidden_states_from_sgl", False))
-        if not collect_hidden_states_from_sgl:
-            logger.debug(
-                f"[EagleTrainer rank {self.rank}] Skipping training step {step} "
-                f"because collect_hidden_states_from_sgl=False"
-            )
             return False
 
         batch = self._prepare_training_batch()
@@ -608,13 +543,6 @@ class EagleBackgroundTrainer:
 
         return True
 
-    def get_model_state_dict(self) -> Optional[dict[str, torch.Tensor]]:
-        """Get trainable model state dict (excluding frozen layers)."""
-        if not self.model:
-            return None
-        trainable_state = self._get_trainable_state_dict()
-        return {k: v.detach().cpu() for k, v in trainable_state.items() if v.requires_grad}
-
     def increment_rl_step(self):
         """Increment the RL step counter in the data buffer.
 
@@ -626,54 +554,27 @@ class EagleBackgroundTrainer:
             f"total samples: {len(self.data_buffer)}"
         )
 
-    async def cleanup_training(self):
-        # First set training as inactive to prevent further steps
-        self._training_active = False
-
+    def cleanup_training(self):
+        """Offload drafter model/optimizer to CPU after training round."""
         # Wait for any pending async checkpoint save to complete
         if self._pending_checkpoint_future is not None:
             logger.debug(f"[Rank {self.rank}] Waiting for pending checkpoint save to complete...")
             try:
-                # Run the blocking .result() call in executor to avoid blocking the event loop
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._pending_checkpoint_future.result)
+                self._pending_checkpoint_future.result()
                 logger.debug(f"[Rank {self.rank}] Pending checkpoint save completed")
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending checkpoint save failed: {e}")
             self._pending_checkpoint_future = None
 
-        # Save final checkpoint and wait for it to complete
+        # Save final checkpoint
         if self.checkpoint_dir and self.model is not None:
             final_future = self._save_checkpoint_async(self.training_steps, is_final=True)
             if final_future is not None:
                 try:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, final_future.result)
+                    final_future.result()
                     logger.info(f"[Rank {self.rank}] Final checkpoint save completed")
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"Final checkpoint save failed: {e}")
-
-        # Clean up distributed resources gracefully
-        if self.training_device_mesh is not None:
-            try:
-                # Give a moment for any pending operations to complete
-                await asyncio.sleep(0.1)
-                if self.training_device_mesh.size() > 1:
-                    # Try to destroy the process group if possible
-                    try:
-                        # Run barrier with timeout to avoid hanging
-                        await asyncio.wait_for(
-                            asyncio.get_event_loop().run_in_executor(
-                                None, lambda: torch.distributed.barrier(self.training_device_mesh.get_group())
-                            ),
-                            timeout=5.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Rank {self.rank} barrier timeout during cleanup, continuing anyway")
-                    except Exception:
-                        pass  # Ignore barrier errors during cleanup
-            except Exception as e:
-                logger.debug(f"Process group cleanup error (expected): {e}")
 
         if self.model is not None:
             try:
@@ -690,20 +591,15 @@ class EagleBackgroundTrainer:
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
 
         self.collected_data.clear()
-        self.data_buffer.clear()  # Clear the cross-step data buffer
-        self.training_device_mesh = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        self._training_initialized = False
         self.training_steps = 0
+        self._last_ckpt_step = -1
 
-    @property
-    def is_training_initialized(self) -> bool:
-        return self._training_initialized
-
-    @property
-    def is_training_active(self) -> bool:
-        return self._training_active
-
-    def set_training_active(self, active: bool):
-        self._training_active = active
+    def train(self, num_steps: int = 200):
+        """Synchronous training convenience method: activate, train N steps, cleanup."""
+        self.activate_training_model()
+        for step in range(num_steps):
+            if not self.training_step(step):
+                break
+        self.cleanup_training()

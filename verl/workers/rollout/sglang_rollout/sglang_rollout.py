@@ -69,7 +69,6 @@ from verl.workers.rollout.schemas import (
     Message,
 )
 from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
-from verl.workers.rollout.sglang_rollout.worker_manager import RolloutDrafterManager
 
 try:
     from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -341,11 +340,8 @@ class SGLangRollout(BaseRollout):
             except AttributeError as e:
                 raise ValueError(f"Cannot get pad_token_id from processing_class {self.processing_class}") from e
 
-        self.drafter_manager = RolloutDrafterManager(device_mesh=self._device_mesh_cpu, rollout_config=self.config)
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.drafter_manager.initialize())
-        self._training_check_task = None
-        self._batch_completion_event = asyncio.Event()
+        # Set by fsdp_workers after construction if drafter training is enabled
+        self.drafter_trainer = None
 
     def _init_distributed_env(self, device_mesh_cpu, **kwargs):
         self._device_mesh_cpu = device_mesh_cpu
@@ -656,9 +652,6 @@ class SGLangRollout(BaseRollout):
         Note that in GRPO, if the prompts are validated, we repeat the prompts for rollout.n times in ray_trainer.
         Thus we do not need to repeat the prompts here and set the sampling parameter n to 1.
         """
-        # Reset batch completion event
-        self._batch_completion_event.clear()
-
         # input ids: (bs, prompt_length), left-padded
         idx = prompts.batch["input_ids"]
         # attention_mask: (bs, seq_length), left-padded
@@ -750,76 +743,32 @@ class SGLangRollout(BaseRollout):
         if self._tp_rank == 0:
             loop = asyncio.get_event_loop()
 
-            output = loop.run_until_complete(self._generate_with_drafter(idx_list, image_list, request_sampling_params))
+            output = loop.run_until_complete(
+                self._engine.async_generate(
+                    prompt=None,
+                    sampling_params=request_sampling_params,
+                    return_logprob=True,
+                    input_ids=idx_list,
+                    image_data=image_list,
+                    return_hidden_states=self._should_collect_hidden_states(),
+                )
+            )
         else:
             output = None
 
         dist.barrier(group=self._device_mesh_cpu["tp"].get_group())
 
-        if (
-            hasattr(self.config, "speculative")
-            and self.use_spec
-            and self.config.speculative.train.enable_drafter_training
-            and self.drafter_manager
-        ):
-            # For early memory release, use a more flexible approach
-            if self._tp_rank == 0:
-                # Master TP rank has the output, share it with other TP ranks in this DP group
-                # But use a timeout to avoid blocking indefinitely
-                try:
-                    [output] = broadcast_pyobj(
-                        data=[output],
-                        rank=self._rank,
-                        dist_group=self._device_mesh_cpu["tp"].get_group(),
-                        src=self._device_mesh_cpu["tp"].mesh[0].item(),
-                        force_cpu_device=False,
-                    )
-                except Exception as e:
-                    logger.warning(f"Worker {self._rank} broadcast failed: {e}, using local output")
-            else:
-                # Non-master TP ranks receive the output
-                try:
-                    [output] = broadcast_pyobj(
-                        data=[None],  # Non-master ranks send None
-                        rank=self._rank,
-                        dist_group=self._device_mesh_cpu["tp"].get_group(),
-                        src=self._device_mesh_cpu["tp"].mesh[0].item(),
-                        force_cpu_device=False,
-                    )
-                except Exception as e:
-                    logger.error(f"Worker {self._rank} failed to receive broadcast: {e}")
-                    # Create dummy output for consistency
-                    output = None
-        else:
-            # Original synchronous broadcast for non-early-release mode
-            [output] = broadcast_pyobj(
-                data=[output],
-                rank=self._rank,
-                dist_group=self._device_mesh_cpu["tp"].get_group(),
-                src=self._device_mesh_cpu["tp"].mesh[0].item(),
-                force_cpu_device=False,
-            )
+        [output] = broadcast_pyobj(
+            data=[output],
+            rank=self._rank,
+            dist_group=self._device_mesh_cpu["tp"].get_group(),
+            src=self._device_mesh_cpu["tp"].mesh[0].item(),
+            force_cpu_device=False,
+        )
 
         dist.barrier(group=self._device_mesh_cpu["tp"].get_group())
-        
-        # Handle case where output might be None for non-master TP ranks
-        if output is not None:
-            out = _post_process_outputs(self.processing_class, output)
-        else:
-            logger.warning(f"Worker {self._rank} received None output, creating dummy response")
-            # Create dummy output - this should not happen in normal operation
-            # but provides fallback for debugging
-            device = idx.device
-            batch_size = idx.size(0)
-            dummy_response = torch.full(
-                (batch_size, self.config.response_length), self.pad_token_id, device=device, dtype=idx.dtype
-            )
-            dummy_logprobs = None
-            if self.config.calculate_log_probs:
-                dummy_logprobs = torch.zeros(
-                    (batch_size, self.config.response_length), device=device, dtype=torch.float32
-                )
-            out = (dummy_response, dummy_logprobs) if dummy_logprobs is not None else (dummy_response,)
+
+        out = _post_process_outputs(self.processing_class, output)
 
         response = out[0].to(idx.device)
         rollout_log_probs = None
@@ -865,37 +814,16 @@ class SGLangRollout(BaseRollout):
         )
 
         # Collect base hidden states for drafter training
-        # Only collect data one step before training to improve efficiency
-        should_collect = False
-        if (
-            self.use_spec
-            and self.config.speculative.train.enable_drafter_training
-            and self.config.speculative.train.get("collect_hidden_states_from_sgl", False)
-            and self.drafter_manager is not None
-            and self.drafter_manager.should_collect_data_this_step()  # Check if we should collect this step
-        ):
-            # Collect if we have the basic requirements
-            should_collect = (
-                self.sharding_manager is not None
-                and hasattr(self.drafter_manager, "background_trainer")
-                and self.drafter_manager.background_trainer is not None
-            )
-
-            if should_collect:
-                # Skip if training has completely finished
-                if hasattr(self.drafter_manager, '_training_finalized') and self.drafter_manager._training_finalized:
-                    should_collect = False
-
+        should_collect = self.drafter_trainer is not None and self._should_collect_hidden_states()
 
         if should_collect:
             logger.info(f"[Rank {self._rank}] Collecting hidden states for drafter training...")
-            # base_hidden = self.sharding_manager.compute_base_hidden_states(seq, attention_mask)
             assert output is not None, "Output from SGLang engine should not be None"
 
             engine_hidden_states = []
             valid_batch_indices = []  # Track which samples have valid hidden states
 
-            for idx, sample in enumerate(output):
+            for sample_idx, sample in enumerate(output):
                 # Convert hidden states to tensors
                 hidden_states_list = []
                 for i in range(len(sample["meta_info"]["hidden_states"])):
@@ -914,9 +842,9 @@ class SGLangRollout(BaseRollout):
                 if hidden_states_list:
                     hidden_states = torch.cat(hidden_states_list, dim=0)
                     engine_hidden_states.append(hidden_states)  # List[ Tensor([seq_len, hidden_dim])]
-                    valid_batch_indices.append(idx)  # Track valid sample index
+                    valid_batch_indices.append(sample_idx)  # Track valid sample index
                 else:
-                    logger.warning(f"No valid hidden states found for sample {idx}, skipping collection")
+                    logger.warning(f"No valid hidden states found for sample {sample_idx}, skipping collection")
 
             # Only collect data if we have valid hidden states
             if engine_hidden_states:
@@ -935,7 +863,7 @@ class SGLangRollout(BaseRollout):
                         # Keep non-tensor or non-batch values as-is
                         filtered_batch[key] = value
 
-                self.drafter_manager.background_trainer.collect_online_data(filtered_batch, engine_hidden_states)
+                self.drafter_trainer.collect_online_data(filtered_batch, engine_hidden_states)
             else:
                 logger.warning(f"[Rank {self._rank}] No engine hidden states to collect for drafter training")
 
@@ -948,87 +876,15 @@ class SGLangRollout(BaseRollout):
             loop = asyncio.get_event_loop()
             loop.run_until_complete(self._engine.flush_cache())
 
-        # Signal batch completion
-        self._batch_completion_event.set()
-
-        # Mark completion
-        if self.drafter_manager:
-            loop = asyncio.get_event_loop()
-            current_worker_id = dist.get_rank()
-
-            logger.info(f"Worker {current_worker_id} generation completed, marking as completed")
-
-            try:
-                loop.run_until_complete(
-                    asyncio.wait_for(self.drafter_manager.mark_worker_completed(current_worker_id), timeout=3.0)
-                )
-            except asyncio.TimeoutError:
-                logger.info(f"Worker {current_worker_id} timed out marking as completed")
-
-            # Wait for training cleanup to complete before next batch using efficient event-based waiting.
-            # This is much faster than polling and only blocks if this worker is actually training.
-            if not self.drafter_manager._training_cleanup_complete.is_set():
-                logger.info(f"Worker {current_worker_id} waiting for training cleanup to complete")
-                start_wait = time.time()
-
-                # Wait for cleanup event with timeout (run in thread to avoid blocking asyncio)
-                cleanup_done = loop.run_until_complete(
-                    asyncio.get_event_loop().run_in_executor(
-                        None, self.drafter_manager._training_cleanup_complete.wait, 10.0
-                    )
-                )
-
-                wait_time = time.time() - start_wait
-                if cleanup_done:
-                    logger.info(f"Worker {current_worker_id} training cleanup completed after {wait_time:.2f}s")
-                else:
-                    logger.warning(
-                        f"Worker {current_worker_id} training cleanup timeout after {wait_time:.2f}s, proceeding anyway"
-                    )
-            # If cleanup_complete event is already set, proceed immediately without any blocking
-
-        # Global barrier to ensure ALL workers finish current batch before any worker starts next batch
-        # This prevents race conditions where fast workers start batch N+1 while slow workers finish batch N
-        logger.info(f"Worker {dist.get_rank()} at barrier, waiting for all workers to complete batch")
-        dist.barrier()
-        logger.info(f"Worker {dist.get_rank()} passed barrier, proceeding to next batch")
-
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
-    async def _generate_with_drafter(self, idx_list, image_list, request_sampling_params):
-        """Generate sequences with early memory release using global coordination."""
-        current_worker_id = dist.get_rank()
-
-        # Perform generation
-        output = await self._engine.async_generate(
-            prompt=None,
-            sampling_params=request_sampling_params,
-            return_logprob=True,
-            input_ids=idx_list,
-            image_data=image_list,
-            return_hidden_states=bool(
-                self.use_spec
-                and self.config.speculative.train.enable_drafter_training
-                and self.config.speculative.train.get("collect_hidden_states_from_sgl", False)
-                and self.drafter_manager is not None
-            ),
+    def _should_collect_hidden_states(self):
+        """Check if we should request hidden states from the SGLang engine."""
+        return (
+            self.use_spec
+            and self.config.speculative.train.enable_drafter_training
+            and self.config.speculative.train.get("collect_hidden_states_from_sgl", False)
         )
-        logger.info(f"Worker {current_worker_id} successfully generated sequences")
-
-        # Release the actual GPU memory from inference
-        if self.sharding_manager is not None:
-            if self._tp_rank == 0:
-                await self.sharding_manager.release_memory()
-
-        # Always empty the CUDA cache to free memory
-        torch.cuda.empty_cache()
-
-        # Notify the coordinator about memory release
-        # The coordinator will decide if training should start via broadcast
-        if self.drafter_manager:
-            await self.drafter_manager.release_worker_memory(current_worker_id)
-
-        return output
 
     async def _async_rollout_a_request(
         self,
@@ -1684,11 +1540,3 @@ class SGLangRollout(BaseRollout):
         await self.sharding_manager.sleep(worker_id)
         self.is_sleep = True
 
-    def increment_rl_step(self):
-        if self.drafter_manager:
-            self.drafter_manager.increment_rl_step()
-            # Also increment the step in the background trainer's data buffer
-            if self.drafter_manager.background_trainer is not None and hasattr(
-                self.drafter_manager.background_trainer, "increment_rl_step"
-            ):
-                self.drafter_manager.background_trainer.increment_rl_step()
