@@ -152,27 +152,9 @@ See `claude_docs/` for comprehensive documentation:
 - **[Speculative Decoding](./claude_docs/speculative-decoding.md)**: SD algorithm, MAB strategy selection
 - **[Key Files Reference](./claude_docs/key-files.md)**: File-by-file guide for hacking
 
-## Development Notes
+## Development Notes, Rules and Preference
 
-### Code Style
-- Uses Hydra for configuration management
-- Ray for distributed training
-- FSDP2 for model sharding
-- SGLang for inference engine
-
-### Testing
-- Benchmark SD speedup with `examples/bench_sd.sh`
-- Verify lossless property by comparing distributions with/without SD
-
-### Debugging
-- Check SD enabled: Look for "Speculative decoding enabled" in logs
-- Monitor acceptance rate: `drafter/acceptance_rate` metric
-- MAB behavior: Debug logs in `eagle_mab.py`
-
-## Dependencies
-
-- Python 3.12+
-- PyTorch 2.x with FSDP2
-- Ray for distributed coordination
-- SGLang (included in `third-party/`)
-- flash-attention 2.8+
+- Check `./claude_docs/workflow-orchestration.md`.
+- Don't overengineering the code. I am researcher, so the code can be experimental. 
+- Don't use too many try catch unless necessary.
+- Use `tasks` to maintain the todos. 

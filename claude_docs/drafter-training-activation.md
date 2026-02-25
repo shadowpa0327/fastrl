@@ -237,12 +237,21 @@ rollout.drafter_manager.background_trainer = EagleBackgroundTrainer(...)
 │  CentralCoordinator._check_and_start_training()                                  │
 │  worker_manager.py:245-283                                                       │
 │                                                                                  │
+│      if self.training_active:                                                    │
+│          return  # ◀── IMPORTANT: once training starts, no more workers join    │
+│                                                                                  │
 │      # Count RELEASED workers                                                   │
 │      released_dp_ranks = {w.dp_rank for w in worker_states.values()             │
 │                           if w.state == WorkerState.RELEASED}                   │
 │                                                                                  │
-│      if len(released_dp_ranks) >= min_workers_for_training:                     │
-│          await self._broadcast_event(CoordinatorEvent.START_TRAINING, ranks)   │
+│      if len(released_dp_ranks) >= min_workers_for_training:  # default: 1       │
+│          # Only first min_workers_for_training are selected                     │
+│          selected = sorted(released_dp_ranks)[:min_workers_for_training]        │
+│          self.training_active = True                                             │
+│          await self._broadcast_event(START_TRAINING, selected_ranks)            │
+│                                                                                  │
+│      # Workers that release AFTER training starts are NOT added.                │
+│      # They sit idle until the entire batch completes.                          │
 └───────────────────────────────────────┬─────────────────────────────────────────┘
                                         │ ZMQ PUB-SUB (broadcast)
                                         ▼
@@ -366,16 +375,40 @@ Worker GPU:
               (lines 1003-1015)          (line 1029)
 ```
 
-The "bubble" is the gap between when inference completes on a worker and when the next batch arrives. `_generate_with_drafter` explicitly frees GPU memory and signals the coordinator, allowing drafter training to occupy that freed GPU.
+The "bubble" is the gap between when inference completes on a worker and when the overall batch finishes (slow workers still generating). `_generate_with_drafter` explicitly frees GPU memory and signals the coordinator, allowing drafter training to occupy that freed GPU.
 
 ## Key Implementation Details
 
-### Not Real "Bubbles" - Sequential Execution
+### Worker Selection for Training
 
-The implementation is **sequential, not truly concurrent**:
-- Training happens **after** rollout completes on a worker
-- It uses the **time gap** between rollout completion and next batch arrival
-- The "free" claim means training doesn't add wall-clock time if it finishes before next rollout
+Not all idle workers train. The selection logic:
+
+1. **First released worker triggers training** (with default `min_workers_for_training: 1`)
+2. **`training_active` flag prevents late joiners** — once set to `True` at line 275, `_check_and_start_training()` returns early at line 247-248 for all subsequent `release` calls
+3. **Late-finishing workers sit idle** — they receive the `START_TRAINING` broadcast but check `if self.rank in command.training_ranks` (line 592) and skip if not selected
+
+With `min_workers_for_training: 1`, only the **single fastest worker** trains. Other workers that finish later are idle until the batch completes.
+
+### Sequential, Not Concurrent
+
+Training happens **after** rollout completes on the selected worker:
+- It fills the **idle time** while slower workers are still generating
+- The "free" claim means training doesn't add wall-clock time if it finishes before the slowest worker
+
+### Training Loop
+
+The training loop (worker_manager.py:722-750) runs up to `max_steps = 200` individual gradient steps, each doing one forward/backward pass. In practice, training is almost always interrupted early by `STOP_TRAINING` when the batch completes:
+
+```python
+# worker_manager.py:722-750
+step = 0
+max_steps = 200
+while self._training_active and step < max_steps:
+    if self._training_stop_event.is_set():   # ZMQ STOP received
+        break
+    await self.background_trainer.training_step(step)
+    step += 1
+```
 
 ### 30-Second Timeout
 

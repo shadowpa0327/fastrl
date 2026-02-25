@@ -222,35 +222,48 @@ speculative.train:
     weight_decay: 0.0              # No weight decay by default
 ```
 
-## Training Loop in RayPPOTrainer
+## Worker Selection for Training
+
+Not all workers train — only the first `min_workers_for_training` (default: **1**) workers to finish rollout are selected:
+
+```
+Workers finish rollout at different times (long-tail):
+
+  GPU 0: ██████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓   ← 1st done, selected for training
+  GPU 1: ██████████████░░░░░░░░░░░░   ← idle (not selected)
+  GPU 2: ██████████████████░░░░░░░░   ← idle (not selected)
+  GPU 7: ████████████████████████████  ← slowest, no gap
+
+  █ rollout  ▓ drafter train  ░ idle
+```
+
+Key mechanism (`worker_manager.py:245-283`):
+1. Worker finishes rollout → sends `"release"` to CentralCoordinator
+2. Coordinator checks: `len(released_workers) >= min_workers_for_training`?
+3. If yes → sets `training_active = True` → broadcasts `START_TRAINING` to selected workers
+4. **Later-releasing workers are blocked**: `if self.training_active: return` (line 247)
+5. Non-selected workers receive the broadcast but check `if self.rank in training_ranks` and skip
+
+## Training Loop
+
+Training runs on the selected worker(s) until the batch completes (`worker_manager.py:722-750`):
 
 ```python
-# In ray_trainer.py, _training_step()
+step = 0
+max_steps = 200  # safety cap, rarely reached
 
-def _training_step(self, step):
-    # ... RL training logic ...
-
-    # Check if drafter training should trigger
-    if self._should_train_drafter(step):
-        # Collect hidden states from recent rollouts
-        data_buffer = self._get_drafter_training_data()
-
-        if len(data_buffer) >= self.config.min_samples:
-            # Trigger background training
-            self.actor_rollout_worker.train_drafter(
-                data_buffer=data_buffer,
-                max_epochs=self.config.max_epochs,
-            )
-
-            # Weight sync happens automatically after training
-
-def _should_train_drafter(self, step):
-    return (
-        self.config.enable_drafter_training and
-        step > 0 and
-        step % self.config.training_interval_steps == 0
-    )
+while self._training_active and step < max_steps:
+    if self._training_stop_event.is_set():  # ZMQ STOP_TRAINING
+        break
+    await self.background_trainer.training_step(step)  # one fwd/bwd pass
+    step += 1
 ```
+
+`STOP_TRAINING` is broadcast when:
+- **(a)** A training worker sends `mark_completed` (its rollout finished), OR
+- **(b)** All workers in the batch complete
+
+In practice, training is almost always interrupted by `STOP_TRAINING` rather than reaching `max_steps`.
 
 ## FSDP2 Integration Details
 

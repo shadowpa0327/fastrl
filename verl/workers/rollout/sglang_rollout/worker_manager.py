@@ -17,12 +17,29 @@ from torch.distributed.device_mesh import DeviceMesh
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+COORD_SOCKET_TIMEOUT_MS = int(os.getenv("VERL_COORD_SOCKET_TIMEOUT_MS", "5000"))
+WORKER_REQ_SOCKET_TIMEOUT_MS = int(os.getenv("VERL_WORKER_REQ_SOCKET_TIMEOUT_MS", "10000"))
+WORKER_SUB_RECV_TIMEOUT_MS = int(os.getenv("VERL_WORKER_SUB_RECV_TIMEOUT_MS", "1000"))
+ZMQ_ENABLE_IPV6 = os.getenv("VERL_ZMQ_ENABLE_IPV6", "1").strip().lower() in ("1", "true", "yes", "on")
 
 def get_free_port() -> int:
     """Get a free port for ZMQ communication."""
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
+    # Prefer IPv4 and fall back to IPv6-only hosts.
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.bind(("", 0))
+                return sock.getsockname()[1]
+        except OSError:
+            continue
+    raise RuntimeError("Unable to allocate free port for ZMQ")
+
+
+def _format_zmq_host(host: str) -> str:
+    """Wrap IPv6 addresses in brackets for ZMQ URI compatibility."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 def get_host_ip():
@@ -30,7 +47,7 @@ def get_host_ip():
     host_ipv4 = os.environ.get("MY_HOST_IP", None)
     host_ipv6 = os.environ.get("MY_HOST_IPV6", None)
     if host_ipv4 or host_ipv6:
-        return host_ipv4 or host_ipv6
+        return _format_zmq_host(host_ipv4 or host_ipv6)
 
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -43,6 +60,19 @@ def get_host_ip():
             return host_ip
     except Exception as e:
         logger.debug(f"Could not auto-detect network IP: {e}")
+
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.settimeout(0.1)
+        s.connect(("2001:4860:4860::8888", 80))
+        host_ip = s.getsockname()[0]
+        s.close()
+        if host_ip and host_ip != "::1":
+            host_ip = host_ip.split("%", 1)[0]
+            logger.info(f"Detected network-accessible IPv6: {host_ip}")
+            return _format_zmq_host(host_ip)
+    except Exception as e:
+        logger.debug(f"Could not auto-detect IPv6: {e}")
 
     logger.warning(
         "Could not determine network-accessible IP. Using 127.0.0.1. "
@@ -96,13 +126,15 @@ class CentralCoordinator:
 
         # REP socket for worker requests (register, release, mark_completed)
         self.rep_socket = self.context.socket(zmq.REP)
-        self.rep_socket.setsockopt(zmq.RCVTIMEO, 5000)
-        self.rep_socket.setsockopt(zmq.SNDTIMEO, 5000)
+        self.rep_socket.setsockopt(zmq.IPV6, int(ZMQ_ENABLE_IPV6))
+        self.rep_socket.setsockopt(zmq.RCVTIMEO, COORD_SOCKET_TIMEOUT_MS)
+        self.rep_socket.setsockopt(zmq.SNDTIMEO, COORD_SOCKET_TIMEOUT_MS)
         self.rep_socket.setsockopt(zmq.LINGER, 0)
         self.rep_socket.bind(f"tcp://*:{req_port}")
 
         # PUB socket for broadcasting events to workers
         self.pub_socket = self.context.socket(zmq.PUB)
+        self.pub_socket.setsockopt(zmq.IPV6, int(ZMQ_ENABLE_IPV6))
         self.pub_socket.setsockopt(zmq.LINGER, 0)
         self.pub_socket.bind(f"tcp://*:{pub_port}")
 
@@ -320,15 +352,17 @@ class WorkerClient:
 
         # REQ socket for sending requests to coordinator
         self.req_socket = self.context.socket(zmq.REQ)
+        self.req_socket.setsockopt(zmq.IPV6, int(ZMQ_ENABLE_IPV6))
         self.req_socket.connect(req_address)
-        self.req_socket.setsockopt(zmq.RCVTIMEO, 10000)
-        self.req_socket.setsockopt(zmq.SNDTIMEO, 10000)
+        self.req_socket.setsockopt(zmq.RCVTIMEO, WORKER_REQ_SOCKET_TIMEOUT_MS)
+        self.req_socket.setsockopt(zmq.SNDTIMEO, WORKER_REQ_SOCKET_TIMEOUT_MS)
 
         # SUB socket for receiving broadcasts from coordinator
         self.sub_socket = self.context.socket(zmq.SUB)
+        self.sub_socket.setsockopt(zmq.IPV6, int(ZMQ_ENABLE_IPV6))
         self.sub_socket.connect(sub_address)
         self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
-        self.sub_socket.setsockopt(zmq.RCVTIMEO, 1000)
+        self.sub_socket.setsockopt(zmq.RCVTIMEO, WORKER_SUB_RECV_TIMEOUT_MS)
 
         self._lock = asyncio.Lock()
 
@@ -524,8 +558,9 @@ class RolloutDrafterManager:
             await asyncio.sleep(0.5)
 
             # Broadcast coordinator addresses
-            req_address = f"tcp://{get_host_ip()}:{req_port}"
-            pub_address = f"tcp://{get_host_ip()}:{pub_port}"
+            host_ip = get_host_ip()
+            req_address = f"tcp://{host_ip}:{req_port}"
+            pub_address = f"tcp://{host_ip}:{pub_port}"
             logger.info(f"Coordinator started: REQ={req_address}, PUB={pub_address}")
         else:
             req_address = None
