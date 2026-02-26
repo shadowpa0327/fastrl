@@ -823,16 +823,22 @@ class SGLangRollout(BaseRollout):
             engine_hidden_states = []
             valid_batch_indices = []  # Track which samples have valid hidden states
 
+            num_empty_samples = 0
             for sample_idx, sample in enumerate(output):
+                raw_hs = sample["meta_info"].get("hidden_states", [])
                 # Convert hidden states to tensors
                 hidden_states_list = []
-                for i in range(len(sample["meta_info"]["hidden_states"])):
-                    h_state = torch.tensor(sample["meta_info"]["hidden_states"][i], dtype=torch.bfloat16)
+                num_empty_chunks = 0
+                num_1d_chunks = 0
+                for i in range(len(raw_hs)):
+                    h_state = torch.tensor(raw_hs[i], dtype=torch.bfloat16)
                     # Skip empty tensors
                     if h_state.numel() == 0:
+                        num_empty_chunks += 1
                         continue
                     # Ensure proper dimensions [1, hidden_dim] or [seq_len, hidden_dim]
                     if h_state.dim() == 1:
+                        num_1d_chunks += 1
                         h_state = h_state.unsqueeze(0)
                     elif h_state.dim() > 2:
                         h_state = h_state.view(-1, h_state.size(-1))
@@ -843,14 +849,26 @@ class SGLangRollout(BaseRollout):
                     hidden_states = torch.cat(hidden_states_list, dim=0)
                     engine_hidden_states.append(hidden_states)  # List[ Tensor([seq_len, hidden_dim])]
                     valid_batch_indices.append(sample_idx)  # Track valid sample index
+                    logger.debug(
+                        f"[Rank {self._rank}] Sample {sample_idx}: "
+                        f"{len(raw_hs)} chunks → {hidden_states.shape} "
+                        f"(empty={num_empty_chunks}, 1d={num_1d_chunks}, 2d={len(hidden_states_list) - num_1d_chunks})"
+                    )
                 else:
-                    logger.warning(f"No valid hidden states found for sample {sample_idx}, skipping collection")
+                    num_empty_samples += 1
+                    logger.debug(
+                        f"[Rank {self._rank}] Sample {sample_idx}: "
+                        f"{len(raw_hs)} chunks, ALL empty — no hidden states collected"
+                    )
 
             # Only collect data if we have valid hidden states
             if engine_hidden_states:
+                total_tokens = sum(hs.shape[0] for hs in engine_hidden_states)
                 logger.info(
-                    f"[Rank {self._rank}] Collecting {len(engine_hidden_states)} hidden states samples "
-                    f"(from {len(output)} total samples)"
+                    f"[Rank {self._rank}] Hidden states: "
+                    f"{len(engine_hidden_states)}/{len(output)} samples valid, "
+                    f"{total_tokens} total tokens, "
+                    f"{num_empty_samples} samples skipped"
                 )
 
                 # Create a filtered batch containing only samples with valid hidden states
@@ -865,7 +883,10 @@ class SGLangRollout(BaseRollout):
 
                 self.drafter_trainer.collect_online_data(filtered_batch, engine_hidden_states)
             else:
-                logger.warning(f"[Rank {self._rank}] No engine hidden states to collect for drafter training")
+                logger.warning(
+                    f"[Rank {self._rank}] No valid hidden states from any of {len(output)} samples — "
+                    f"drafter training data not collected this batch"
+                )
 
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor

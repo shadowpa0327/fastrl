@@ -9,8 +9,8 @@ This document provides a quick reference to the most important files for underst
 | Training Entry | `verl/trainer/main_fastrl.py` | ~185 | FastRL training entry point |
 | RL Orchestration | `verl/trainer/ppo/ray_trainer.py` | ~1423 | Main training loop, worker coordination |
 | FSDP Workers | `verl/workers/fsdp_workers.py` | ~2500 | Actor, Critic, Rollout workers |
-| Drafter Co-training | `verl/workers/drafter/eagle_background_trainer.py` | ~708 | **Novel: EAGLE co-training** |
-| SGLang Rollout | `verl/workers/rollout/sglang_rollout/sglang_rollout.py` | ~1693 | Inference engine integration |
+| Drafter Co-training | `verl/workers/drafter/eagle_background_trainer.py` | ~600 | **Novel: EAGLE co-training** |
+| SGLang Rollout | `verl/workers/rollout/sglang_rollout/sglang_rollout.py` | ~1540 | Inference engine integration |
 | EAGLE Worker | `third-party/sglang/.../eagle_worker.py` | ~500+ | Speculative decoding execution |
 | MAB Strategy | `third-party/sglang/.../eagle_mab.py` | ~200 | **Novel: Adaptive SD strategy** |
 | Config | `verl/trainer/config/fastrl_trainer.yaml` | ~200 | All hyperparameters |
@@ -132,8 +132,8 @@ class ActorRolloutRefWorker:
         # Lines ~900-1100
 
     def train_drafter(self):
-        """Trigger EAGLE drafter training."""
-        # Lines ~1100-1300
+        """Synchronous foreground EAGLE drafter training."""
+        # Lines ~998-1007
         # KEY: This is where co-training is triggered
 
 class CriticWorker:
@@ -162,33 +162,37 @@ class EagleBackgroundTrainer:
     This is the CORE INNOVATION of FastRL.
     """
 
-    def __init__(self, config, device_mesh, model_cls):
-        # Lines ~50-150
+    def __init__(self, model, optimizer, scheduler, config, device_mesh, model_config):
+        # Lines ~30-90
         # Hack: Model initialization, FSDP config
 
-    def _train_step(self, batch):
-        # Lines ~200-350
-        """
-        Single training step:
-        1. Prepare shifted hidden states
-        2. Forward through drafter
-        3. Compute SmoothL1 loss
-        4. Backward + optimizer step
-        """
+    def train(self, num_steps=200):
+        # Lines ~595-600
+        """Top-level entry: activate → train N steps → cleanup."""
+        # Hack: Training lifecycle
+
+    def training_step(self, step):
+        # Lines ~412-420
+        """Single fwd/bwd/optim step with error handling."""
         # Hack: Loss function, training dynamics
 
-    def get_drafter_weights(self):
-        # Lines ~400-450
-        """Extract weights for SGLang sync."""
-        # Hack: Weight filtering, export format
+    def activate_training_model(self):
+        # Lines ~135-150
+        """Load drafter model+optimizer from CPU to GPU."""
+        # Hack: Memory management
 
-    def sync_weights_to_sglang(self):
-        # Lines ~450-500
-        """Push weights to inference engine."""
-        # Hack: Sync mechanism, timing
+    def cleanup_training(self):
+        # Lines ~555-595
+        """Offload to CPU, save checkpoint, reset state."""
+        # Hack: Cleanup logic
+
+    def collect_online_data(self, batch, hidden_states):
+        # Lines ~160-230
+        """Add rollout data to training buffer."""
+        # Hack: Data collection
 
     def _save_checkpoint_async(self):
-        # Lines ~500-600
+        # Lines ~110-130
         """Async DCP checkpointing."""
         # Hack: Checkpoint format, frequency
 ```
@@ -223,29 +227,28 @@ class Qwen2EagleModel(nn.Module):
 ## Speculative Decoding
 
 ### `verl/workers/rollout/sglang_rollout/sglang_rollout.py`
-**Purpose**: SGLang integration for inference (~1693 lines)
+**Purpose**: SGLang integration for inference (~1540 lines)
 
 ```python
 class SGLangRollout:
     """Manages SGLang inference engine."""
 
     def __init__(self, config):
-        # Lines ~50-200
+        # Lines ~247-344
         # Hack: Engine initialization, memory config
+        self.drafter_trainer = None  # Set by fsdp_workers after construction
 
-    def generate(self, prompts, sampling_params):
-        # Lines ~300-600
+    def _batch_level_generate_sequences(self, prompts):
+        # Lines ~614-879
         """
         Generate sequences with speculative decoding.
-
-        Key: Hidden state collection happens here.
+        Collects hidden states for drafter training.
         """
         # Hack: Sampling modifications, output processing
 
-    def update_drafter_weights(self, weights):
-        # Lines ~700-800
-        """Update EAGLE weights in running engine."""
-        # Hack: Hot-reload mechanism
+    def _should_collect_hidden_states(self):
+        # Lines ~881-887
+        """Check config flags for hidden state collection."""
 ```
 
 **Hack here for**: Inference behavior, hidden state collection, engine config
@@ -372,15 +375,18 @@ main_fastrl.py
             │       │
             │       ├──▶ sglang_rollout.py
             │       │       │
-            │       │       └──▶ eagle_worker.py
-            │       │               │
-            │       │               └──▶ eagle_mab.py
+            │       │       └──▶ SGLang engine (eagle_worker.py + eagle_mab.py)
             │       │
             │       └──▶ eagle_background_trainer.py
             │               │
-            │               └──▶ qwen2_eagle.py (model)
+            │               └──▶ qwen2_eagle.py / llama_eagle.py (model)
             │
             └──▶ core_algos.py
+
+Key ownership:
+  fsdp_workers owns drafter_trainer
+  rollout holds shared ref (for data collection only)
+  ray_trainer calls train_drafter() + increment_rl_step()
 ```
 
 ## SGLang Hidden States Collection Files

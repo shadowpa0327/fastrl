@@ -11,128 +11,167 @@ Traditional approaches train the drafter separately (offline), leading to:
 
 FastRL's co-training approach:
 - Trains drafter continuously during RL training
-- Uses spare GPU resources (no additional cost)
+- Uses FSDP2 data-parallel training across TP groups
 - Maintains high acceptance rates throughout training
 
 ## Implementation Overview
 
+Drafter training runs as a **synchronous foreground phase** in the RL loop, orchestrated by `RayPPOTrainer`:
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Co-training Decision Flow                            │
-│                                                                              │
-│   RayPPOTrainer._training_step()                                            │
-│           │                                                                  │
-│           ▼                                                                  │
-│   ┌───────────────────────────────────────────────────────────────────────┐ │
-│   │  if (step % training_interval_steps == 0) and enable_drafter_training │ │
-│   │     and (len(data_buffer) >= min_samples):                             │ │
-│   │                                                                        │ │
-│   │     trigger_drafter_training()                                         │ │
-│   └───────────────────────────────────────────────────────────────────────┘ │
-│           │                                                                  │
-│           ▼                                                                  │
-│   ┌───────────────────────────────────────────────────────────────────────┐ │
-│   │  EagleBackgroundTrainer.train_step(                                   │ │
-│   │      data_buffer=collected_hidden_states,                              │ │
-│   │      actor_model=current_actor_weights,                                │ │
-│   │  )                                                                     │ │
-│   └───────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+RayPPOTrainer._training_step()
+        │
+        ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Phase 1: Rollout (generate_sequences)                      │
+  │    - SGLang generates with speculative decoding              │
+  │    - Hidden states collected into data buffer                │
+  └────────────────────────────┬────────────────────────────────┘
+        │
+        ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Phase 2: Drafter Training (train_drafter)                  │
+  │    if (rl_step % training_interval == 0):                   │
+  │                                                              │
+  │    fsdp_workers.train_drafter()                             │
+  │      └── drafter_trainer.train(num_steps=200)               │
+  │            ├── activate_training_model()  # CPU → GPU        │
+  │            ├── for step in range(num_steps):                 │
+  │            │     training_step(step)      # fwd/bwd/optim   │
+  │            └── cleanup_training()         # GPU → CPU        │
+  └────────────────────────────┬────────────────────────────────┘
+        │
+        ▼
+  Phase 3: Reward → Actor Update → Critic Update → next step
 ```
 
 ## Key File: `eagle_background_trainer.py`
 
-**Location**: `verl/workers/drafter/eagle_background_trainer.py` (708 lines)
+**Location**: `verl/workers/drafter/eagle_background_trainer.py`
 
 ### Class Structure
 
 ```python
 class EagleBackgroundTrainer:
     """
-    FSDP2-compatible background trainer for EAGLE draft model.
+    FSDP2-compatible trainer for EAGLE draft model.
 
     Responsibilities:
-    1. Initialize drafter model with frozen embeddings
-    2. Manage training loop with data buffer
-    3. Handle async checkpointing
-    4. Synchronize weights to SGLang inference engine
+    1. Manage drafter model GPU offloading (CPU ↔ GPU)
+    2. Collect hidden states from rollouts into data buffer
+    3. Run training loop with FSDP2 gradient sync
+    4. Handle async checkpointing
     """
 
-    def __init__(self, config, device_mesh, model_cls, tokenizer):
-        # Initialize drafter model
-        self.drafter_model = self._create_drafter_model()
+    def __init__(self, model, optimizer, scheduler, config, device_mesh, model_config):
+        self.model = model                  # FSDP2-wrapped drafter
+        self.optimizer = optimizer          # AdamW
+        self.training_device_mesh = device_mesh  # Per-DP-group mesh
+        self.data_buffer = DataBuffer(...)  # Cross-step data storage
+        self.collected_data = deque(...)    # Per-step data collection
+```
 
-        # Apply FSDP2 sharding
-        self.drafter_model = self._apply_fsdp2(self.drafter_model)
+### Top-Level Entry: `train()`
 
-        # Setup optimizer (AdamW default)
-        self.optimizer = self._create_optimizer()
-
-        # Data buffer for hidden states
-        self.data_buffer = deque(maxlen=config.buffer_size)  # default: 2000
+```python
+def train(self, num_steps: int = 200):
+    """Synchronous training: activate, train N steps, cleanup."""
+    self.activate_training_model()     # Load model+optimizer to GPU
+    for step in range(num_steps):
+        if not self.training_step(step):  # Returns False to stop early
+            break
+    self.cleanup_training()             # Offload back to CPU
 ```
 
 ### Training Step Implementation
 
 ```python
-def _train_step(self, batch):
-    """Single training iteration on drafter model."""
-
+def _training_step_impl(self, step, batch):
     # Unpack batch
-    input_ids = batch['input_ids']           # (B, L)
-    hidden_states = batch['hidden_states']   # (B, L, D)
-    loss_mask = batch['loss_mask']           # (B, L)
+    input_ids = batch['input_ids']           # (1, total_seq_len)
+    hidden_states = batch['hidden_states']   # (1, total_seq_len, D)
+    loss_mask = batch['loss_mask']           # (1, total_seq_len)
 
-    # Prepare inputs: shift hidden states by 1 position
-    # Input: hidden_states[:, :-1, :]  (predict next from current)
-    # Target: hidden_states[:, 1:, :]  (what we want to predict)
-    input_hidden = hidden_states[:, :-1, :]
-    target_hidden = hidden_states[:, 1:, :]
-    input_tokens = input_ids[:, :-1]
-
-    # Forward through drafter
-    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        pred_hidden = self.drafter_model(
-            input_hidden=input_hidden,
-            input_ids=input_tokens,
-        )
-
-    # Compute loss (SmoothL1 for stability)
-    loss = F.smooth_l1_loss(
-        pred_hidden,
-        target_hidden,
-        reduction='none'
+    # Forward through drafter (with FSDP2 all-gather)
+    outputs = self.model(
+        input_ids=input_ids,
+        hidden_states=hidden_states,
+        output_hidden_states=True,
     )
 
-    # Apply mask and reduce
-    loss = (loss * loss_mask[:, 1:, None]).sum() / loss_mask[:, 1:].sum()
+    # Compute loss (SmoothL1 for stability)
+    loss = smooth_l1_loss(pred_hidden, target_hidden, reduction='none')
+    loss = (loss * loss_mask).sum() / loss_mask.sum()
 
-    # Backward pass (FSDP2 handles gradient sync)
+    # Backward (FSDP2 reduce-scatter handles gradient sync)
     loss.backward()
 
-    # Optimizer step
+    # Optimizer step (each GPU updates its local shard)
     self.optimizer.step()
     self.optimizer.zero_grad()
-
-    return loss.item()
 ```
 
-### Weight Synchronization to SGLang
+## FSDP2 Data Parallel Training (TP=4 Example)
+
+With 8 GPUs and TP=4, we get 2 independent DP groups:
+
+```
+DP Group 0: GPU [0, 1, 2, 3]  ← drafter FSDP mesh
+DP Group 1: GPU [4, 5, 6, 7]  ← drafter FSDP mesh
+
+Each group trains independently (no cross-group communication).
+```
+
+### Within a DP Group
+
+```
+Step 1: Data (identical buffer on all 4 GPUs from broadcast)
+───────────────────────────────────────────────────────────
+Pool: [sample_A, sample_B, ..., sample_N]  (same on all GPUs)
+
+GPU0: random.sample() → [A, D]     ← likely different
+GPU1: random.sample() → [B, F]     ← likely different
+GPU2: random.sample() → [C, A]     ← can overlap
+GPU3: random.sample() → [E, B]     ← can overlap
+
+Step 2: Forward (FSDP2 all-gathers full params)
+───────────────────────────────────────────────
+GPU0        GPU1        GPU2        GPU3
+  │           │           │           │
+  └──── all-gather (collect full params) ────┘
+  │           │           │           │
+  ▼           ▼           ▼           ▼
+forward     forward     forward     forward
+(batch_0)   (batch_1)   (batch_2)   (batch_3)
+
+Step 3: Backward (FSDP2 reduce-scatter averages grads)
+──────────────────────────────────────────────────────
+grad_0      grad_1      grad_2      grad_3
+  │           │           │           │
+  └──── reduce-scatter (average + re-shard) ─────┘
+  │           │           │           │
+  ▼           ▼           ▼           ▼
+grad_shard  grad_shard  grad_shard  grad_shard
+   _0          _1          _2          _3
+
+Step 4: optimizer.step() — each GPU updates local shard only
+```
+
+## Weight Synchronization to SGLang
 
 Drafter weights are **not explicitly synced after training**. Instead, they sync automatically at the **start of the next rollout** via a shared FSDP module reference.
 
-**The shared reference** (`fsdp_workers.py:788-798`):
+**The shared reference** (`fsdp_workers.py`):
 
 ```python
 # Same drafter_module_fsdp object is given to both:
-rollout.drafter_manager.background_trainer = EagleBackgroundTrainer(
+self.drafter_trainer = EagleBackgroundTrainer(
     drafter_module_fsdp, ...       # ← Training updates this in-place
 )
 rollout_sharding_manager.drafter_module = drafter_module_fsdp  # ← wake_up() reads from this
 ```
 
-**Sync happens in `wake_up()`** (`fsdp_sglang.py:196-266`), triggered by `with self.rollout_sharding_manager:` at the start of each rollout:
+**Sync happens in `wake_up()`** (`fsdp_sglang.py`), triggered by `with self.rollout_sharding_manager:` at the start of each rollout:
 
 ```python
 async def wake_up(self):
@@ -145,21 +184,6 @@ async def wake_up(self):
         drafter_params = self.drafter_module.state_dict()  # reads trained weights
         drafter_params = convert_weight_keys(drafter_params, ...)
         await self.update_drafter_weights(drafter_params)  # pushes to SGLang
-```
-
-**Weight transfer pipeline** (`fsdp_sglang.py:143-162`):
-
-```
-drafter_module.state_dict()   →  FSDP DTensor (sharded)
-         │ full_tensor()
-         ▼
-Regular Tensor (gathered)     →  convert_weight_keys()
-         │ get_named_tensor_buckets()
-         ▼
-Batched tensors               →  sgl_update_weights(is_draft_model=True)
-         │ dist.gather_object() across TP ranks
-         ▼
-SGLang engine                 →  flush_cache()
 ```
 
 **Timeline**:
@@ -176,30 +200,26 @@ Step N+1: with sharding_manager: ───────────────�
 
 ## Hidden State Collection
 
-Hidden states are collected from SGLang during speculative decoding verification:
+Hidden states are collected during rollout from SGLang's speculative decoding verification step:
 
 ```python
 # In sglang_rollout.py
-def generate_sequences(self, prompts, ...):
-    # Enable hidden state collection
-    sampling_params = SamplingParams(
+def _batch_level_generate_sequences(self, prompts, ...):
+    output = self._engine.async_generate(
         ...,
-        return_hidden_states=True,  # Key flag
+        return_hidden_states=self._should_collect_hidden_states(),
     )
 
-    outputs = self.engine.generate(prompts, sampling_params)
+    # Extract hidden states from output
+    if should_collect:
+        for sample in output:
+            hidden_states = torch.tensor(sample["meta_info"]["hidden_states"])
+            engine_hidden_states.append(hidden_states)
 
-    # Extract hidden states from outputs
-    for output in outputs:
-        hidden_states = output.hidden_states  # (L, D)
-        self.data_buffer.append({
-            'input_ids': output.token_ids,
-            'hidden_states': hidden_states,
-            'loss_mask': output.loss_mask,
-        })
+        self.drafter_trainer.collect_online_data(filtered_batch, engine_hidden_states)
 ```
 
-This is efficient because hidden states are already computed during the verification step of speculative decoding - no extra forward passes needed.
+This is efficient because hidden states are already computed during the verification step — no extra forward passes needed.
 
 ## Training Schedule
 
@@ -210,11 +230,11 @@ Configuration Parameters (fastrl_trainer.yaml):
 speculative.train:
   enable_drafter_training: true    # Master switch
   training_interval_steps: 10      # Train every N RL steps
+  max_training_steps_per_round: 200  # Max gradient steps per round
+  collect_hidden_states_from_sgl: true  # Collect from SGLang engine
   batch_size_per_gpu: 2            # Per-GPU batch size
   max_seq_len: 8192                # Max sequence length
-  max_epochs: 10                   # Epochs per training trigger
   checkpoint_path: null            # Optional checkpoint save path
-  min_workers_for_training: 1      # Min workers required
 
   optim:
     lr: 1e-6                       # Learning rate (conservative)
@@ -222,48 +242,16 @@ speculative.train:
     weight_decay: 0.0              # No weight decay by default
 ```
 
-## Worker Selection for Training
-
-Not all workers train — only the first `min_workers_for_training` (default: **1**) workers to finish rollout are selected:
-
-```
-Workers finish rollout at different times (long-tail):
-
-  GPU 0: ██████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓   ← 1st done, selected for training
-  GPU 1: ██████████████░░░░░░░░░░░░   ← idle (not selected)
-  GPU 2: ██████████████████░░░░░░░░   ← idle (not selected)
-  GPU 7: ████████████████████████████  ← slowest, no gap
-
-  █ rollout  ▓ drafter train  ░ idle
-```
-
-Key mechanism (`worker_manager.py:245-283`):
-1. Worker finishes rollout → sends `"release"` to CentralCoordinator
-2. Coordinator checks: `len(released_workers) >= min_workers_for_training`?
-3. If yes → sets `training_active = True` → broadcasts `START_TRAINING` to selected workers
-4. **Later-releasing workers are blocked**: `if self.training_active: return` (line 247)
-5. Non-selected workers receive the broadcast but check `if self.rank in training_ranks` and skip
-
-## Training Loop
-
-Training runs on the selected worker(s) until the batch completes (`worker_manager.py:722-750`):
+Training is gated by two checks in `fsdp_workers.train_drafter()`:
 
 ```python
-step = 0
-max_steps = 200  # safety cap, rarely reached
-
-while self._training_active and step < max_steps:
-    if self._training_stop_event.is_set():  # ZMQ STOP_TRAINING
-        break
-    await self.background_trainer.training_step(step)  # one fwd/bwd pass
-    step += 1
+def train_drafter(self):
+    if not self._enable_drafter_training:
+        return
+    if self._drafter_rl_step % self._drafter_training_interval != 0:
+        return
+    self.drafter_trainer.train(num_steps=self._drafter_max_steps)
 ```
-
-`STOP_TRAINING` is broadcast when:
-- **(a)** A training worker sends `mark_completed` (its rollout finished), OR
-- **(b)** All workers in the batch complete
-
-In practice, training is almost always interrupted by `STOP_TRAINING` rather than reaching `max_steps`.
 
 ## FSDP2 Integration Details
 
@@ -271,7 +259,8 @@ In practice, training is almost always interrupted by `STOP_TRAINING` rather tha
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         FSDP2 Sharding for Drafter                          │
 │                                                                              │
-│   Device Mesh: (dp=N, tp=1) for drafter (simpler than target model)        │
+│   Device Mesh: per-DP-group (e.g. [0,1,2,3] for TP=4)                     │
+│   Same mesh used for both inference TP and drafter FSDP                    │
 │                                                                              │
 │   ┌─────────────────────────────────────────────────────────────────────┐  │
 │   │                      Drafter Model Structure                         │  │
@@ -305,11 +294,9 @@ In practice, training is almost always interrupted by `STOP_TRAINING` rather tha
 ```python
 def _save_checkpoint_async(self, step):
     """Non-blocking checkpoint save using DCP async_save."""
-
     if self.checkpoint_path is None:
         return
 
-    # Prepare state dict (FSDP aware)
     state_dict = {
         'model': self._get_trainable_state_dict(),
         'optimizer': self.optimizer.state_dict(),
@@ -321,29 +308,8 @@ def _save_checkpoint_async(self, step):
     dcp.async_save(
         state_dict,
         checkpoint_dir,
-        process_group=self.process_group,
+        process_group=self.training_device_mesh.get_group(),
     )
-
-    logger.info(f"Initiated async checkpoint save to {checkpoint_dir}")
-```
-
-## Monitoring and Metrics
-
-Key metrics to track:
-- `drafter/loss`: Training loss (should decrease)
-- `drafter/acceptance_rate`: Acceptance rate during SD
-- `drafter/training_time`: Time spent in drafter training
-- `drafter/buffer_size`: Current data buffer size
-
-```python
-# Logging in train_step
-metrics = {
-    'drafter/loss': avg_loss,
-    'drafter/epochs': num_epochs,
-    'drafter/samples': len(data_buffer),
-    'drafter/lr': current_lr,
-}
-wandb.log(metrics, step=global_step)
 ```
 
 ## Tuning Guidelines
@@ -353,7 +319,7 @@ wandb.log(metrics, step=global_step)
 | High acceptance rate (>0.7) | Reduce training frequency (interval=20) |
 | Low acceptance rate (<0.4) | Increase training frequency (interval=5) |
 | Memory pressure | Reduce batch_size_per_gpu |
-| Fast target evolution | Decrease interval, increase epochs |
+| Fast target evolution | Decrease interval, increase max_steps |
 | Stable target model | Increase interval, save compute |
 
 ## See Also

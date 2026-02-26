@@ -121,8 +121,8 @@ if should_collect:
         else:
             filtered_batch[key] = value
 
-    # Pass to background trainer
-    self.drafter_manager.background_trainer.collect_online_data(
+    # Pass to drafter trainer (shared ref set by fsdp_workers)
+    self.drafter_trainer.collect_online_data(
         filtered_batch,
         engine_hidden_states
     )
@@ -955,7 +955,7 @@ class LlamaModel(LlamaModelTF):
 
 | Component | File | Key Lines | Purpose |
 |-----------|------|-----------|---------|
-| Background Trainer | `eagle_background_trainer.py` | 275-456, 458-609 | Online training during RL |
+| Drafter Trainer | `eagle_background_trainer.py` | `collect_online_data()`, `_training_step_impl()` | Online training during RL |
 | Standalone Dataset | `eagle-train/eagle_trainer.py` | 47-84, 98-147 | Offline data loading |
 | Loss Computation | `eagle-train/eagle_trainer.py` | 357-392 | EAGLE2 loss |
 | EAGLE Model | `eagle-train/model/llama_eagle.py` | 34-99 | Model forward pass |

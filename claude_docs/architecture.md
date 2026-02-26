@@ -4,49 +4,62 @@
 
 FastRL is an RL training system that co-trains EAGLE draft models alongside the main target model. The key insight is that spare GPU resources during RL training can be harvested for continuous drafter alignment.
 
-## Unified Overview (8 GPUs, TP=1)
+## Unified Overview (8 GPUs, TP=4)
 
 This diagram shows the complete system end-to-end: how the RL loop, speculative decoding,
-hidden state collection, drafter co-training, and weight synchronization all fit together.
+hidden state collection, foreground drafter co-training, and weight synchronization all fit together.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  RayPPOTrainer          RL Loop: Rollout → Reward → Actor Upd → Critic Upd → ↺ │
-│  batch.chunk(8) ──┬──                                                           │
-└───────────────────┼─────────────────────────────────────────────────────────────┘
-   GPU 0    GPU 1   │      GPU 7           Per-Worker Lifecycle
-  ┌─────┐ ┌─────┐  │    ┌─────┐          ┌─────────────────────────────────────┐
-  │SGLng│ │SGLng│  │    │SGLng│          │ PHASE 1: Rollout                    │
-  │Actor│ │Actor│◀─┘    │Actor│          │                                     │
-  │Draft│ │Draft│  ...  │Draft│          │ wake_up() ──▶ sync weights ──▶ SGLang│
-  └─────┘ └─────┘       └─────┘          │                                     │
-     │  FSDP sync   │                    │ EAGLE Draft ─▶ Verify ─▶ MAB Select │
-     └──────────────┘                    │       └─▶ hidden states ─▶ buffer   │
-                                          └──────────────────┬──────────────────┘
-                                                             │
-  Workers finish at different times (long-tail):              ▼
-  ┌──────────────────────────────────┐   ┌─────────────────────────────────────┐
-  │ GPU 0: ██████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │   │ PHASE 2: "Bubble" Co-training      │
-  │ GPU 1: ██████████████░░░░░░░░░░ │   │                                     │
-  │ GPU 2: ██████████████████░░░░░░ │   │ 1st worker done → "release"         │
-  │ GPU 7: ████████████████████████ │   │   → CentralCoordinator ZMQ START    │
-  │                              ▲  │   │   → activate (CPU→GPU) → train      │
-  │  █ rollout                   │  │   │ only min_workers_for_training (=1)  │
-  │  ▓ drafter train (1st done)  │  │   │   workers train; rest idle (░)      │
-  │  ░ idle (not selected)  done─┘  │   │ all done → ZMQ STOP → cleanup      │
-  └──────────────────────────────────┘   └──────────────────┬──────────────────┘
-                                                             │
-                                                             ▼
-                                          ┌─────────────────────────────────────┐
-                                          │ PHASE 3: RL Update                  │
-                                          │                                     │
-                                          │ FSDP all-reduce ──▶ optimizer.step  │
-                                          └──────────────────┬──────────────────┘
-                                                             │
-                                          ┌──────────────────┘
-                                          ▼
-                                   Back to PHASE 1
-                             (wake_up syncs trained drafter)
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│  RayPPOTrainer                                                                      │
+│  RL Loop: Rollout → Train Drafter → Reward → Actor Upd → Critic Upd → ↺            │
+└──────────────────────────────┬──────────────────────────────────────────────────────┘
+                               │
+   DP Group 0            DP Group 1          Per-Worker Lifecycle
+  GPU [0,1,2,3]         GPU [4,5,6,7]       ┌────────────────────────────────────┐
+  ┌──────────┐          ┌──────────┐        │ PHASE 1: Rollout                   │
+  │ SGLang   │          │ SGLang   │        │                                    │
+  │ TP=4     │          │ TP=4     │        │ wake_up() → sync weights → SGLang  │
+  │ +Drafter │          │ +Drafter │        │ EAGLE Draft → Verify → MAB Select  │
+  │ (FSDP2)  │          │ (FSDP2)  │        │     └─▶ hidden states → buffer     │
+  └──────────┘          └──────────┘        └──────────────────┬─────────────────┘
+       │                     │                                  │
+       │   Independent       │                                  ▼
+       │   (no cross-group   │              ┌────────────────────────────────────┐
+       │    communication)   │              │ PHASE 2: Foreground Drafter Train  │
+       │                     │              │                                    │
+       │                     │              │ train_drafter() dispatched to ALL   │
+       │                     │              │   → activate (CPU→GPU)             │
+       │                     │              │   → N training steps (FSDP2)       │
+       │                     │              │   → cleanup (GPU→CPU)              │
+       │                     │              └──────────────────┬─────────────────┘
+       │                     │                                  │
+       └─────────────────────┘                                  ▼
+                                            ┌────────────────────────────────────┐
+                                            │ PHASE 3: RL Update                 │
+                                            │                                    │
+                                            │ FSDP all-reduce → optimizer.step   │
+                                            └──────────────────┬─────────────────┘
+                                                               │
+                                            ┌──────────────────┘
+                                            ▼
+                                     Back to PHASE 1
+                               (wake_up syncs trained drafter)
+```
+
+### FSDP2 Training Within a DP Group (TP=4)
+
+During Phase 2, each DP group trains its drafter independently using FSDP2:
+
+```
+DP Group 0: GPU [0, 1, 2, 3]
+  Each GPU holds 1/4 of drafter params (FSDP2 sharded)
+  All GPUs have identical data buffer (from broadcast)
+  Each GPU samples its own mini-batch (data parallelism)
+
+  Forward:  all-gather params → each GPU computes on its batch
+  Backward: reduce-scatter gradients (averaged across 4 GPUs)
+  Optimize: each GPU updates its local 1/4 shard
 ```
 
 ## Multi-Armed Bandit Strategy Selection
@@ -126,8 +139,8 @@ hidden state collection, drafter co-training, and weight synchronization all fit
 │  │  └─────────────────────────────┘  └─────────────────────────────────┘ │ │
 │  │                                                                         │ │
 │  │  ┌─────────────────────────────┐  ┌─────────────────────────────────┐ │ │
-│  │  │    Gradients (transient)    │  │   Drafter Training (background) │ │ │
-│  │  │                             │  │   Uses spare compute cycles     │ │ │
+│  │  │    Gradients (transient)    │  │   Drafter Training (foreground) │ │ │
+│  │  │                             │  │   Runs between rollout & update │ │ │
 │  │  └─────────────────────────────┘  └─────────────────────────────────┘ │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
