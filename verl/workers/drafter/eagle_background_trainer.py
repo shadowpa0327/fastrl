@@ -60,9 +60,12 @@ class EagleBackgroundTrainer:
 
         # Initialize DataBuffer for storing data across RL steps
         buffer_max_size = int(self.config.get("data_buffer_max_size", 10000))
-        # Only store hidden states in buffer if we're collecting them during generation
-        collect_hidden_states_from_sgl = bool(self.config.get("collect_hidden_states_from_sgl", False))
-        self.data_buffer = DataBuffer(max_size=buffer_max_size, store_hidden_states=collect_hidden_states_from_sgl)
+        # Store hidden states in buffer when collecting from either SGLang or actor
+        store_hs = (
+            bool(self.config.get("collect_hidden_states_from_sgl", False))
+            or bool(self.config.get("collect_hidden_states_from_actor", False))
+        )
+        self.data_buffer = DataBuffer(max_size=buffer_max_size, store_hidden_states=store_hs)
 
         self.criterion = SmoothL1Loss(reduction="none")
 
