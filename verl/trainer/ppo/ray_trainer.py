@@ -1148,10 +1148,6 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
-                    # Train drafter model synchronously after rollout
-                    with marked_timer("train_drafter", timing_raw, color="green"):
-                        self.actor_rollout_wg.train_drafter()
-
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1201,9 +1197,8 @@ class RayPPOTrainer:
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    # recompute old_log_probs
+                    # recompute old_log_probs (also collects hidden states for drafter if enabled)
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        # TODO: Also collect hidden states from compute_log_prob for drafter training
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
 
@@ -1270,6 +1265,10 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                    # Train drafter after all forward passes, before backward passes
+                    with marked_timer("train_drafter", timing_raw, color="green"):
+                        self.actor_rollout_wg.train_drafter()
 
                     # update critic
                     if self.use_critic:

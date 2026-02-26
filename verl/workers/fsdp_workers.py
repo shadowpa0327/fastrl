@@ -802,6 +802,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if enable_drafter_training else 0
         )
         self._drafter_rl_step = 0
+        self._collect_hs_from_actor = (
+            enable_drafter_training
+            and self.config.rollout.speculative.train.get("collect_hidden_states_from_actor", False)
+            and not self.config.rollout.speculative.train.get("collect_hidden_states_from_sgl", False)
+        )
 
         return rollout, rollout_sharding_manager
 
@@ -1027,8 +1032,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from contextlib import nullcontext
 
         is_lora = data.meta_info.pop("is_lora", False)
-        return_hidden_states = data.meta_info.pop("return_hidden_states", False)
+        return_hidden_states = data.meta_info.pop("return_hidden_states", False) or self._collect_hs_from_actor
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+
+        # Capture batch info for drafter BEFORE data.to(device) to avoid GPU→CPU copy
+        if self._collect_hs_from_actor:
+            drafter_batch = {
+                "input_ids": data.batch["input_ids"].detach().clone(),
+                "responses": data.batch["responses"].detach().clone(),
+            }
+
         data = data.to(get_device_id())
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
@@ -1044,12 +1057,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 else:
                     output, entropys = result
 
+            # Feed hidden states directly to drafter trainer (stays on worker, not in DataProto)
+            if self._collect_hs_from_actor and self.drafter_trainer is not None:
+                self.drafter_trainer.collect_online_data(drafter_batch, hidden_states)
+
             output_dict = {"old_log_probs": output, "entropys": entropys}
             meta_info_dict = {"temperature": self.config.rollout.temperature}
-
-            # If hidden_states were returned, add them to meta_info
-            if return_hidden_states:
-                meta_info_dict["hidden_states"] = hidden_states
 
             output = DataProto.from_dict(
                 tensors=output_dict,
